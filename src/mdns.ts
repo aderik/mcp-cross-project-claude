@@ -1,5 +1,25 @@
 import { Bonjour } from "bonjour-service";
 import type { Service } from "bonjour-service";
+import { networkInterfaces } from "node:os";
+
+/**
+ * Routable IPv4 addresses for this machine. Excludes loopback and link-local
+ * (169.254/16). Used as a TXT-record fallback when avahi/bonjour-service
+ * fail to publish A records correctly.
+ */
+function localIPv4s(): string[] {
+  const result: string[] = [];
+  const ifaces = networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name] ?? []) {
+      if (iface.family !== "IPv4") continue;
+      if (iface.internal) continue;
+      if (iface.address.startsWith("169.254.")) continue;
+      result.push(iface.address);
+    }
+  }
+  return result;
+}
 
 export const SERVICE_TYPE_SESSION = "mcp-bridge"; // _mcp-bridge._tcp.local
 export const SERVICE_TYPE_PAIR = "mcp-bridge-pair"; // _mcp-bridge-pair._tcp.local
@@ -24,6 +44,11 @@ function bonjour(): Bonjour {
 }
 
 export function advertise(opts: AdvertOptions): { stop: () => void } {
+  // Embed our own IPv4 addresses in the TXT record so peers can connect
+  // directly even if the responder's A records don't make it across (some
+  // avahi configurations only publish AAAA link-local). The asker will
+  // try each address in order.
+  const ips = localIPv4s().join(",");
   const svc = bonjour().publish({
     name: `${opts.label}@${opts.fingerprint.slice(0, 8)}`,
     type: opts.serviceType,
@@ -33,6 +58,7 @@ export function advertise(opts: AdvertOptions): { stop: () => void } {
       label: opts.label,
       fp: opts.fingerprint,
       v: "1",
+      ips,
     },
   });
   return {
@@ -59,12 +85,21 @@ function serviceToPeer(s: Service): DiscoveredPeer | null {
   const label = txt.label;
   const fp = txt.fp;
   if (!label || !fp) return null;
+  // Prefer IPs from TXT (robust against bonjour-service / avahi quirks in
+  // populating A records). Fall back to bonjour's discovered addresses,
+  // then to the hostname.
+  const txtIps = (txt.ips ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const addresses =
+    txtIps.length > 0 ? txtIps : s.addresses && s.addresses.length > 0 ? s.addresses : [];
   return {
     label,
     fingerprint: fp,
     host: s.host,
     port: s.port,
-    addresses: s.addresses ?? [],
+    addresses,
   };
 }
 

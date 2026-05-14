@@ -1,7 +1,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { createServer, createConnection } from "node:net";
+import { createServer } from "node:net";
 import { randomUUID } from "node:crypto";
 import { advertise, findPeerByFingerprint, SERVICE_TYPE_SESSION, shutdownMdns } from "./mdns.js";
 import {
@@ -15,7 +15,7 @@ import { FramedSocket, sessionInitiator, sessionResponder } from "./transport.js
 import type { AskRequest, AskResponse, SecureChannel } from "./transport.js";
 import { runClaudeQuestion } from "./engine.js";
 import { Semaphore } from "./semaphore.js";
-import { fingerprint, log } from "./util.js";
+import { fingerprint, log, tryConnect } from "./util.js";
 import { AlreadyPairedError, runPairSend, startPairReceive } from "./pair.js";
 import type { PairReceiveSession } from "./pair.js";
 
@@ -393,21 +393,21 @@ async function askPeer(question: string, cfg: ServeConfig): Promise<string> {
   if (!peer) {
     throw new Error("No paired peer. Use start_pairing on one side and complete_pairing on the other.");
   }
-  let host = cfg.peerHost;
-  let port = cfg.peerPort;
-  if (!host || !port) {
+  let candidates: string[];
+  let port: number;
+  if (cfg.peerHost && cfg.peerPort) {
+    candidates = [cfg.peerHost];
+    port = cfg.peerPort;
+  } else {
     if (!cfg.useMdns) {
       throw new Error("No PEER_HOST/PEER_PORT set and mDNS disabled — cannot route question.");
     }
     const discovered = await findPeerByFingerprint(SERVICE_TYPE_SESSION, peer.fingerprint, 5_000);
-    host = discovered.addresses[0] ?? discovered.host;
+    candidates =
+      discovered.addresses.length > 0 ? discovered.addresses : [discovered.host];
     port = discovered.port;
   }
-  const socket = createConnection({ host, port });
-  await new Promise<void>((res, rej) => {
-    socket.once("connect", () => res());
-    socket.once("error", (err) => rej(err));
-  });
+  const socket = await tryConnect(candidates, port);
   const framed = new FramedSocket(socket);
   const kp = ourKeypair();
   const peerStatic = Buffer.from(peer.publicKey, "base64");

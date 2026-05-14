@@ -1,9 +1,9 @@
-import { createConnection, createServer } from "node:net";
+import { createServer } from "node:net";
 import { getPairedPeer, ourKeypair, ourLabel, setPairedPeer } from "./state.js";
 import type { PairedPeer } from "./state.js";
 import { advertise, findAnyPeer, SERVICE_TYPE_PAIR } from "./mdns.js";
 import { FramedSocket, pairInitiator, pairResponder } from "./transport.js";
-import { fingerprint, pinToPsk, randomPin } from "./util.js";
+import { fingerprint, pinToPsk, randomPin, tryConnect } from "./util.js";
 
 const PAIR_HANDSHAKE_TIMEOUT_MS = 10_000;
 const PAIR_WINDOW_MS = 60_000;
@@ -161,16 +161,20 @@ export async function runPairSend(opts: {
     throw new Error("PIN must be exactly 4 digits");
   }
 
-  let host = opts.host;
-  let port = opts.port;
-  if (!host || !port) {
+  let candidates: string[];
+  let port: number;
+  if (opts.host && opts.port) {
+    candidates = [opts.host];
+    port = opts.port;
+  } else {
     if (!opts.useMdns) {
       throw new Error(
         "mDNS disabled and no explicit host/port. Pairing requires mDNS to find the other bridge."
       );
     }
     const discovered = await findAnyPeer(SERVICE_TYPE_PAIR, 10_000);
-    host = discovered.addresses[0] ?? discovered.host;
+    candidates =
+      discovered.addresses.length > 0 ? discovered.addresses : [discovered.host];
     port = discovered.port;
   }
 
@@ -178,11 +182,7 @@ export async function runPairSend(opts: {
   const kp = ourKeypair();
   const label = ourLabel();
 
-  const socket = createConnection({ host, port });
-  await new Promise<void>((res, rej) => {
-    socket.once("connect", () => res());
-    socket.once("error", (err) => rej(err));
-  });
+  const socket = await tryConnect(candidates, port);
   const framed = new FramedSocket(socket);
   const channel = await pairInitiator(framed, kp, psk, PAIR_HANDSHAKE_TIMEOUT_MS);
 

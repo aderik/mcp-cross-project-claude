@@ -1,4 +1,5 @@
 import { createHash, hkdfSync, randomBytes } from "node:crypto";
+import { createConnection, type Socket } from "node:net";
 
 export function log(level: "info" | "warn" | "error", msg: string): void {
   // stderr only; stdout is the MCP transport.
@@ -32,6 +33,49 @@ export function fingerprint(pub: Buffer): string {
 
 export function ensureBuffer(b: Uint8Array | Buffer): Buffer {
   return Buffer.isBuffer(b) ? b : Buffer.from(b);
+}
+
+/**
+ * Try to TCP-connect to each host in order; return the first successful
+ * socket. Used to iterate over candidate addresses pulled from mDNS, since
+ * a single advertisement may include several IPs and only some are
+ * reachable from the asker.
+ */
+export async function tryConnect(
+  hosts: string[],
+  port: number,
+  perAttemptTimeoutMs = 2000
+): Promise<Socket> {
+  if (hosts.length === 0) {
+    throw new Error("tryConnect: no candidate hosts");
+  }
+  const errors: string[] = [];
+  for (const host of hosts) {
+    try {
+      const socket = createConnection({ host, port });
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          socket.destroy();
+          reject(new Error(`timeout after ${perAttemptTimeoutMs}ms`));
+        }, perAttemptTimeoutMs);
+        socket.once("connect", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        socket.once("error", (err) => {
+          clearTimeout(timer);
+          socket.destroy();
+          reject(err);
+        });
+      });
+      return socket;
+    } catch (err) {
+      errors.push(`${host}: ${(err as Error).message}`);
+    }
+  }
+  throw new Error(
+    `Could not connect to ${hosts.join(", ")} on port ${port}. Tried: ${errors.join("; ")}`
+  );
 }
 
 export function timeoutPromise<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
