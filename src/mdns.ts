@@ -127,6 +127,19 @@ export function findPeerByFingerprint(
   );
 }
 
+/**
+ * Return the first peer advertising the given service type, regardless of
+ * label or fingerprint. Used during pairing-send: the asker has no peer
+ * identity to match on yet — they just look for whoever is currently in
+ * pairing mode.
+ */
+export function findAnyPeer(
+  serviceType: typeof SERVICE_TYPE_SESSION | typeof SERVICE_TYPE_PAIR,
+  timeoutMs: number
+): Promise<DiscoveredPeer> {
+  return findPeer(serviceType, () => true, `any peer of type _${serviceType}._tcp`, timeoutMs);
+}
+
 export function shutdownMdns(): void {
   if (bonjourInstance) {
     try {

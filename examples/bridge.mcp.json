@@ -2,7 +2,7 @@
   "mcpServers": {
     "cross-project": {
       "command": "npx",
-      "args": ["-y", "mcp-cross-project-claude", "serve"]
+      "args": ["-y", "mcp-cross-project-claude"]
     }
   }
 }

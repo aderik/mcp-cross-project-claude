@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
-import { createHash, randomBytes } from "node:crypto";
+import { basename, dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { generateKeyPair } from "noise-handshake/dh.js";
 import { ensureBuffer, fingerprint } from "./util.js";
 
@@ -38,22 +38,15 @@ function safeSlug(s: string): string {
 }
 
 /**
- * Default state dir is keyed by absolute cwd so each project gets its own
- * identity, keypair, and paired peer. Two Claude Code sessions in different
- * project dirs will never share identity or fingerprint, even though they
- * are launched by the same binary at the same user-scope MCP entry.
- *
- * Override with the STATE_DIR env-var if you want a specific path (e.g.,
- * shared state across project dirs, or a per-machine fixed location).
+ * Default state dir is shared across all projects on this machine: one
+ * identity, one paired peer, usable from any cwd where the bridge runs.
+ * Override with the STATE_DIR env-var to scope state per-project if you
+ * need isolation (e.g., separate pairings for separate codebases).
  */
 function defaultStateDir(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
   const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config");
-  const root = join(base, "mcp-cross-project-claude");
-  const cwd = resolvePath(process.cwd());
-  const slug = safeSlug(basename(cwd) || "bridge");
-  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
-  return join(root, `${slug}-${hash}`);
+  return join(base, "mcp-cross-project-claude");
 }
 
 export function statePath(): string {

@@ -1,24 +1,18 @@
-# End-to-end test scripts
+# Test scripts
 
-Three integration tests that exercise the bridge with real `claude -p` and
-real network traffic over loopback, plus one transport-only unit test for
-the chunking of large payloads. The integration tests cost a small amount of
-API credit; the transport test costs nothing.
-
-Prerequisites: `node`, `claude` CLI authenticated, repo built (`npm run
-build`).
-
-Run from the repo root, in this order:
+Two tests. Run from the repo root.
 
 ```bash
-bash tests/e2e-pair-and-ask.sh           # pair + question A → B
-bash tests/e2e-recursion-and-wire.sh     # no recursion, no cleartext on wire
-bash tests/e2e-reverse.sh                # question B → A
-node  tests/transport-large.mjs          # >64KB payload round-trips intact
+node tests/transport-large.mjs   # Transport-layer chunking (no claude CLI, no cost)
+bash tests/e2e-mcp.sh             # Pair + question end-to-end via MCP tools (real claude -p)
 ```
 
-The integration scripts work in two scratch project dirs under
-`/tmp/e2e-bridge/`, simulating two machines via loopback. They all use
-`NO_MDNS=1` + `PEER_HOST`/`PEER_PORT` — that path also exercises the manual
-hostname fallback. mDNS itself is harder to test on a single machine
-(loopback multicast is flaky on most setups).
+The integration test (`e2e-mcp.sh`) requires the `claude` CLI on PATH and
+costs a small amount of API credit per run for the spawned `claude -p` that
+answers the question.
+
+The test uses two scratch project dirs under `/tmp/e2e-bridge/`, simulating
+two machines via loopback. It uses the internal `BRIDGE_PAIR_HOST` /
+`BRIDGE_PAIR_PORT` env-vars to bypass mDNS for pairing on loopback (mDNS over
+loopback is flaky on most setups). In real cross-machine use, mDNS handles
+peer discovery automatically.

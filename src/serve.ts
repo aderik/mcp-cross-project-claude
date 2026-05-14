@@ -5,6 +5,7 @@ import { createServer, createConnection } from "node:net";
 import { randomUUID } from "node:crypto";
 import { advertise, findPeerByFingerprint, SERVICE_TYPE_SESSION, shutdownMdns } from "./mdns.js";
 import {
+  clearPairedPeer,
   findPeerByPublicKey,
   getPairedPeer,
   ourKeypair,
@@ -15,8 +16,14 @@ import type { AskRequest, AskResponse, SecureChannel } from "./transport.js";
 import { runClaudeQuestion } from "./engine.js";
 import { Semaphore } from "./semaphore.js";
 import { fingerprint, log } from "./util.js";
+import { AlreadyPairedError, runPairSend, startPairReceive } from "./pair.js";
+import type { PairReceiveSession } from "./pair.js";
 
-export const TOOL_NAME = "ask_cross_project";
+export const TOOL_ASK = "ask_cross_project";
+export const TOOL_START_PAIRING = "start_pairing";
+export const TOOL_COMPLETE_PAIRING = "complete_pairing";
+export const TOOL_UNPAIR = "unpair_peer";
+export const TOOL_PEER_STATUS = "peer_status";
 
 interface ServeConfig {
   projectDir: string;
@@ -25,6 +32,8 @@ interface ServeConfig {
   useMdns: boolean;
   peerHost?: string;
   peerPort?: number;
+  pairHost?: string;
+  pairPort?: number;
   sessionTimeoutMs: number;
   claudeTimeoutMs: number;
   claudeBin: string;
@@ -43,6 +52,9 @@ function readConfig(): ServeConfig {
     useMdns: process.env.NO_MDNS !== "1",
     peerHost: process.env.PEER_HOST,
     peerPort: process.env.PEER_PORT ? Number(process.env.PEER_PORT) : undefined,
+    // Internal test-only overrides: bypass mDNS during pair-send.
+    pairHost: process.env.BRIDGE_PAIR_HOST,
+    pairPort: process.env.BRIDGE_PAIR_PORT ? Number(process.env.BRIDGE_PAIR_PORT) : undefined,
     sessionTimeoutMs: Number(process.env.SESSION_TIMEOUT_MS ?? 30_000),
     claudeTimeoutMs: Number(process.env.CLAUDE_TIMEOUT_MS ?? 180_000),
     claudeBin: process.env.CLAUDE_BIN ?? "claude",
@@ -64,10 +76,9 @@ export async function serve(): Promise<void> {
   }
 
   const kp = ourKeypair();
-  const label = ourLabel();
   const ourFp = fingerprint(kp.publicKey);
-  const peer = getPairedPeer();
   const semaphore = new Semaphore(cfg.maxConcurrent);
+  let pendingPair: PairReceiveSession | null = null;
 
   // ---------- TCP listener (incoming peer questions) ----------
   const tcpServer = createServer();
@@ -91,7 +102,7 @@ export async function serve(): Promise<void> {
     try {
       advert = advertise({
         serviceType: SERVICE_TYPE_SESSION,
-        label,
+        label: ourLabel(),
         fingerprint: ourFp,
         port: actualPort,
       });
@@ -103,8 +114,8 @@ export async function serve(): Promise<void> {
   // ---------- MCP stdio server (local AI client) ----------
   const mcp = new Server(
     {
-      name: `cross-project-claude:${label}`,
-      version: "0.3.0",
+      name: `cross-project-claude:${ourLabel()}`,
+      version: "0.4.0",
     },
     { capabilities: { tools: {} } }
   );
@@ -112,43 +123,166 @@ export async function serve(): Promise<void> {
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
-        name: TOOL_NAME,
+        name: TOOL_ASK,
         description:
-          `Ask a question to a read-only Claude Code agent running in a paired project on ` +
-          `another machine (or another directory on this machine). The agent can read its own ` +
-          `project files and answer in text, but cannot modify them and cannot see anything in ` +
-          `the calling project. Use this to gather factual context from another project without ` +
-          `pulling its source into the current conversation. Be specific in your question.`,
+          `Ask a question to a read-only Claude Code agent running in a paired project ` +
+          `on another machine. The agent can read its own project files and answer in text, ` +
+          `but cannot modify them and cannot see anything in this project. Use this to ` +
+          `gather factual context from another project without pulling its source into the ` +
+          `current conversation. Be specific in your question.`,
         inputSchema: {
           type: "object",
           properties: {
-            question: {
-              type: "string",
-              description: "The question to ask the paired peer. Self-contained and specific.",
-            },
+            question: { type: "string", description: "Self-contained, specific question." },
           },
           required: ["question"],
           additionalProperties: false,
         },
       },
+      {
+        name: TOOL_START_PAIRING,
+        description:
+          `Put this bridge into pairing mode and return a 4-digit PIN. Read the PIN to the ` +
+          `user and tell them to give it to the AI on the other machine, which will call ` +
+          `complete_pairing(pin). The pairing window is 60 seconds and accepts one attempt. ` +
+          `Refuses if a peer is already paired (call unpair_peer first).`,
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      },
+      {
+        name: TOOL_COMPLETE_PAIRING,
+        description:
+          `Complete pairing using a PIN obtained from the other machine's start_pairing call. ` +
+          `Auto-discovers the peer on the LAN via mDNS. The PIN is the only input needed. ` +
+          `Refuses if this bridge is already paired.`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            pin: { type: "string", description: "The 4-digit PIN from the other side's start_pairing." },
+          },
+          required: ["pin"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: TOOL_UNPAIR,
+        description:
+          `Forget the currently paired peer. After this, ask_cross_project will fail until a ` +
+          `new pairing is completed. Run before re-pairing if a peer was already set.`,
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      },
+      {
+        name: TOOL_PEER_STATUS,
+        description:
+          `Return this bridge's identity and the paired peer (if any). Useful to check ` +
+          `whether pairing is set up before asking a cross-project question.`,
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      },
     ],
   }));
 
   mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params.name !== TOOL_NAME) {
-      return { content: [{ type: "text", text: `Unknown tool: ${request.params.name}` }], isError: true };
-    }
+    const name = request.params.name;
     const args = request.params.arguments ?? {};
-    const question = (args as { question?: unknown }).question;
-    if (typeof question !== "string" || !question.trim()) {
-      return { content: [{ type: "text", text: "`question` must be a non-empty string." }], isError: true };
-    }
     try {
-      const answer = await askPeer(question, cfg);
-      return { content: [{ type: "text", text: answer }] };
+      if (name === TOOL_ASK) {
+        const question = (args as { question?: unknown }).question;
+        if (typeof question !== "string" || !question.trim()) {
+          return errOut("`question` must be a non-empty string.");
+        }
+        const answer = await askPeer(question, cfg);
+        return okOut(answer);
+      }
+      if (name === TOOL_START_PAIRING) {
+        if (pendingPair) {
+          pendingPair.cancel();
+          pendingPair = null;
+        }
+        const session = await startPairReceive({ useMdns: cfg.useMdns });
+        pendingPair = session;
+        session.completion.then(
+          (peer) => {
+            log("info", `pairing succeeded: peer=${peer.label} fp=${peer.fingerprint}`);
+            pendingPair = null;
+          },
+          (err: Error) => {
+            log("warn", `pairing did not complete: ${err.message}`);
+            pendingPair = null;
+          }
+        );
+        return okOut(
+          JSON.stringify(
+            {
+              pin: session.pin,
+              expires_in_seconds: 60,
+              host: session.host,
+              port: session.port,
+              note:
+                "Tell the user this PIN. On the other machine, the user asks their Claude to " +
+                "complete_pairing with this PIN.",
+            },
+            null,
+            2
+          )
+        );
+      }
+      if (name === TOOL_COMPLETE_PAIRING) {
+        const pin = (args as { pin?: unknown }).pin;
+        if (typeof pin !== "string" || !pin.trim()) {
+          return errOut("`pin` must be a non-empty string.");
+        }
+        const peer = await runPairSend({
+          pin: pin.trim(),
+          useMdns: cfg.useMdns,
+          host: cfg.pairHost,
+          port: cfg.pairPort,
+        });
+        return okOut(
+          JSON.stringify(
+            {
+              paired: true,
+              peer_label: peer.label,
+              peer_fingerprint: peer.fingerprint,
+            },
+            null,
+            2
+          )
+        );
+      }
+      if (name === TOOL_UNPAIR) {
+        if (pendingPair) {
+          pendingPair.cancel();
+          pendingPair = null;
+        }
+        const removed = clearPairedPeer();
+        return okOut(removed ? "Unpaired." : "No paired peer to remove.");
+      }
+      if (name === TOOL_PEER_STATUS) {
+        const peer = getPairedPeer();
+        return okOut(
+          JSON.stringify(
+            {
+              our_label: ourLabel(),
+              our_fingerprint: ourFp,
+              paired: peer
+                ? {
+                    label: peer.label,
+                    fingerprint: peer.fingerprint,
+                    paired_at: peer.pairedAt,
+                  }
+                : null,
+              pairing_in_progress: pendingPair !== null,
+            },
+            null,
+            2
+          )
+        );
+      }
+      return errOut(`Unknown tool: ${name}`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { content: [{ type: "text", text: `Bridge error: ${msg}` }], isError: true };
+      if (err instanceof AlreadyPairedError) {
+        return errOut(err.message);
+      }
+      return errOut(err instanceof Error ? err.message : String(err));
     }
   });
 
@@ -157,14 +291,15 @@ export async function serve(): Promise<void> {
 
   log(
     "info",
-    `ready. label=${label} cwd=${cfg.projectDir} ` +
-      `peer=${peer ? `${peer.label} (fp=${peer.fingerprint})` : "(unpaired)"} ` +
+    `ready. label=${ourLabel()} cwd=${cfg.projectDir} ` +
+      `peer=${getPairedPeer() ? `${getPairedPeer()!.label} (fp=${getPairedPeer()!.fingerprint})` : "(unpaired)"} ` +
       `listen=${addr.address}:${actualPort} fp=${ourFp} ` +
       `mdns=${cfg.useMdns ? "on" : "off"} allowedTools=[${cfg.allowedTools}] ` +
       `maxConcurrent=${cfg.maxConcurrent} depth=${cfg.depth}`
   );
 
   const shutdown = (): void => {
+    if (pendingPair) pendingPair.cancel();
     if (advert) advert.stop();
     shutdownMdns();
     tcpServer.close();
@@ -172,6 +307,13 @@ export async function serve(): Promise<void> {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+function okOut(text: string): { content: Array<{ type: "text"; text: string }>; isError?: false } {
+  return { content: [{ type: "text", text }] };
+}
+function errOut(message: string): { content: Array<{ type: "text"; text: string }>; isError: true } {
+  return { content: [{ type: "text", text: message }], isError: true };
 }
 
 // ---------- Incoming: peer asks us a question ----------
@@ -249,7 +391,7 @@ async function handleIncoming(
 async function askPeer(question: string, cfg: ServeConfig): Promise<string> {
   const peer = getPairedPeer();
   if (!peer) {
-    throw new Error("No paired peer. Run `pair-receive` on one side and `pair-send` on the other.");
+    throw new Error("No paired peer. Use start_pairing on one side and complete_pairing on the other.");
   }
   let host = cfg.peerHost;
   let port = cfg.peerPort;
@@ -270,11 +412,7 @@ async function askPeer(question: string, cfg: ServeConfig): Promise<string> {
   const kp = ourKeypair();
   const peerStatic = Buffer.from(peer.publicKey, "base64");
   const channel = await sessionInitiator(framed, kp, peerStatic, cfg.sessionTimeoutMs);
-  const req: AskRequest = {
-    type: "ask",
-    id: randomUUID(),
-    question,
-  };
+  const req: AskRequest = { type: "ask", id: randomUUID(), question };
   channel.send(Buffer.from(JSON.stringify(req), "utf8"));
   const respRaw = await channel.recv(cfg.sessionTimeoutMs + cfg.claudeTimeoutMs);
   channel.close();
