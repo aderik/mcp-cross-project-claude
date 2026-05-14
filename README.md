@@ -32,10 +32,12 @@ Each bridge runs as a single process per project, with four roles:
 4. **Answering engine**. For each authenticated incoming question, spawns a
    fresh, ephemeral `claude -p` in the bridge's `cwd`.
 
-Identity (label, long-term keypair, paired peer) lives in
-`~/.config/mcp-cross-project-claude/state.json` (or `$STATE_DIR/state.json`).
-It is created on first run and persisted thereafter. Nothing about identity
-goes through env vars.
+Identity (label, long-term keypair, paired peer) lives in a per-project state
+file under `~/.config/mcp-cross-project-claude/<basename-of-cwd>-<sha8-of-cwd>/state.json`.
+The path is keyed by absolute `cwd` so each project gets its own identity,
+keypair, and paired peer — even when the bridge is registered at user-scope
+in Claude Code and shared across all your projects. Override with `STATE_DIR`
+if you want a different path or to share state across project dirs.
 
 ## Install
 
@@ -133,7 +135,7 @@ run `unpair` first.
 | `MODEL`                     | (Claude default)   | Override the spawned session's model.                                |
 | `MAX_BUDGET_USD`            | (no cap)           | Per-call spend cap. Forwarded to `claude --max-budget-usd`.          |
 | `MAX_CONCURRENT_QUESTIONS`  | `3`                | Cap on simultaneous `claude -p` spawns answered by this bridge.      |
-| `STATE_DIR`                 | XDG config dir     | Override location of the persisted state file.                       |
+| `STATE_DIR`                 | per-cwd subdir     | Override location of the persisted state file. Default is keyed by absolute cwd. |
 
 ## Security model
 

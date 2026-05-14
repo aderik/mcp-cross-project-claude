@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
 import { generateKeyPair } from "noise-handshake/dh.js";
 import { ensureBuffer, fingerprint } from "./util.js";
 
@@ -33,10 +33,27 @@ interface StateV1 {
 
 type AnyState = StateV1 | StateV2;
 
+function safeSlug(s: string): string {
+  return s.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "bridge";
+}
+
+/**
+ * Default state dir is keyed by absolute cwd so each project gets its own
+ * identity, keypair, and paired peer. Two Claude Code sessions in different
+ * project dirs will never share identity or fingerprint, even though they
+ * are launched by the same binary at the same user-scope MCP entry.
+ *
+ * Override with the STATE_DIR env-var if you want a specific path (e.g.,
+ * shared state across project dirs, or a per-machine fixed location).
+ */
 function defaultStateDir(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
-  if (xdg && xdg.length > 0) return join(xdg, "mcp-cross-project-claude");
-  return join(homedir(), ".config", "mcp-cross-project-claude");
+  const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config");
+  const root = join(base, "mcp-cross-project-claude");
+  const cwd = resolvePath(process.cwd());
+  const slug = safeSlug(basename(cwd) || "bridge");
+  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+  return join(root, `${slug}-${hash}`);
 }
 
 export function statePath(): string {
@@ -51,9 +68,7 @@ function shortRandomSuffix(): string {
 
 function freshLabel(): string {
   // Basename of cwd at first init + 4-hex random suffix. Persistent thereafter.
-  const base = basename(process.cwd()) || "bridge";
-  // Strip anything that's not [a-zA-Z0-9_-]
-  const safe = base.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "bridge";
+  const safe = safeSlug(basename(process.cwd()) || "bridge");
   return `${safe}-${shortRandomSuffix()}`;
 }
 
