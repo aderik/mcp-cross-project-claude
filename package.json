@@ -1,7 +1,7 @@
 {
   "name": "@aderik/mcp-cross-project-claude",
-  "version": "0.1.0",
-  "description": "MCP server that bridges two Claude Code projects: ask read-only questions across project boundaries without pulling the other project's source into the caller's context.",
+  "version": "0.2.0",
+  "description": "Encrypted LAN bridge between two Claude Code projects: ask read-only questions across project boundaries (and across machines) without pulling the other project's source into the caller's context.",
   "type": "module",
   "bin": {
     "mcp-cross-project-claude": "dist/index.js"
@@ -45,7 +45,9 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4"
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "bonjour-service": "^1.3.0",
+    "noise-handshake": "^4.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.7.5",

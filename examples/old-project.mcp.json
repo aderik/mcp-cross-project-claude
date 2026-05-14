@@ -4,15 +4,16 @@
       "command": "npx",
       "args": [
         "-y",
-        "@aderik/mcp-cross-project-claude"
+        "@aderik/mcp-cross-project-claude",
+        "serve"
       ],
       "env": {
-        "TARGET_DIR": "/absolute/path/to/nieuwe-accelerate",
-        "TARGET_LABEL": "new-accelerate",
+        "PROJECT_DIR": "/absolute/path/to/oude-accelerate",
+        "PROJECT_LABEL": "legacy-accelerate",
         "TOOL_NAME": "ask_new",
-        "POSTURE_PRESET": "new",
-        "TIMEOUT_MS": "180000",
-        "ALLOWED_TOOLS": "Read,Glob,Grep"
+        "PEER_LABEL": "new-accelerate",
+        "POSTURE_PRESET": "legacy",
+        "CLAUDE_TIMEOUT_MS": "180000"
       }
     }
   }
