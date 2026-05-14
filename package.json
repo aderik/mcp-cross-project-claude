@@ -1,0 +1,54 @@
+{
+  "name": "@aderik/mcp-cross-project-claude",
+  "version": "0.1.0",
+  "description": "MCP server that bridges two Claude Code projects: ask read-only questions across project boundaries without pulling the other project's source into the caller's context.",
+  "type": "module",
+  "bin": {
+    "mcp-cross-project-claude": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "postures",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "bridge",
+    "subagent",
+    "cross-project"
+  ],
+  "author": "Aderik Teekman <aderik@live.nl>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aderik/mcp-cross-project-claude.git"
+  },
+  "homepage": "https://github.com/aderik/mcp-cross-project-claude#readme",
+  "bugs": {
+    "url": "https://github.com/aderik/mcp-cross-project-claude/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "typescript": "^5.6.3"
+  }
+}

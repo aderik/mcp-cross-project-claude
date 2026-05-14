@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "ask-new": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@aderik/mcp-cross-project-claude"
+      ],
+      "env": {
+        "TARGET_DIR": "/absolute/path/to/nieuwe-accelerate",
+        "TARGET_LABEL": "new-accelerate",
+        "TOOL_NAME": "ask_new",
+        "POSTURE_PRESET": "new",
+        "TIMEOUT_MS": "180000",
+        "ALLOWED_TOOLS": "Read,Glob,Grep"
+      }
+    }
+  }
+}

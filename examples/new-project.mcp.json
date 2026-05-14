@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "ask-legacy": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@aderik/mcp-cross-project-claude"
+      ],
+      "env": {
+        "TARGET_DIR": "/absolute/path/to/oude-accelerate",
+        "TARGET_LABEL": "legacy-accelerate",
+        "TOOL_NAME": "ask_legacy",
+        "POSTURE_PRESET": "legacy",
+        "TIMEOUT_MS": "180000",
+        "ALLOWED_TOOLS": "Read,Glob,Grep"
+      }
+    }
+  }
+}
