@@ -66,7 +66,7 @@ export async function pairReceive(opts: { useMdns: boolean; bindHost?: string })
   console.log(`  Window:       ${PAIR_WINDOW_MS / 1000}s (single attempt)`);
   console.log("");
   console.log("On the OTHER machine, run:");
-  console.log(`  npx -y @aderik/mcp-cross-project-claude pair-send --peer-label ${label} --pin ${pin}`);
+  console.log(`  npx -y mcp-cross-project-claude pair-send --peer-label ${label} --pin ${pin}`);
   console.log("");
 
   let attempted = false;

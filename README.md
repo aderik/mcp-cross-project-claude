@@ -1,4 +1,4 @@
-# @aderik/mcp-cross-project-claude
+# mcp-cross-project-claude
 
 An encrypted LAN bridge that lets an AI session in one project ask read-only
 questions to a Claude Code agent running in another project — on the same
@@ -48,7 +48,7 @@ Drop this snippet into the calling project's `.mcp.json`:
   "mcpServers": {
     "cross-project": {
       "command": "npx",
-      "args": ["-y", "@aderik/mcp-cross-project-claude", "serve"]
+      "args": ["-y", "mcp-cross-project-claude", "serve"]
     }
   }
 }
@@ -72,7 +72,7 @@ On the **receiving** machine:
 
 ```bash
 cd /path/to/project-A
-npx -y @aderik/mcp-cross-project-claude pair-receive
+npx -y mcp-cross-project-claude pair-receive
 ```
 
 Sample output:
@@ -88,14 +88,14 @@ Sample output:
   Window:       60s (single attempt)
 
 On the OTHER machine, run:
-  npx -y @aderik/mcp-cross-project-claude pair-send --peer-label project-A-3f2a --pin 4729
+  npx -y mcp-cross-project-claude pair-send --peer-label project-A-3f2a --pin 4729
 ```
 
 On the **sending** machine, within 60 seconds:
 
 ```bash
 cd /path/to/project-B
-npx -y @aderik/mcp-cross-project-claude pair-send --peer-label project-A-3f2a --pin 4729
+npx -y mcp-cross-project-claude pair-send --peer-label project-A-3f2a --pin 4729
 ```
 
 Both sides print `Pairing succeeded` and persist the peer's public key,
