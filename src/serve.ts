@@ -13,7 +13,7 @@ import {
 } from "./state.js";
 import { FramedSocket, sessionInitiator, sessionResponder } from "./transport.js";
 import type { AskRequest, AskResponse, SecureChannel } from "./transport.js";
-import { runClaudeQuestion } from "./engine.js";
+import { defaultLogFile, runClaudeQuestion } from "./engine.js";
 import { Semaphore } from "./semaphore.js";
 import { fingerprint, log, tryConnect } from "./util.js";
 import { AlreadyPairedError, runPairSend, startPairReceive } from "./pair.js";
@@ -42,6 +42,7 @@ interface ServeConfig {
   maxBudgetUsd?: string;
   depth: number;
   maxConcurrent: number;
+  logFile: string;
 }
 
 function readConfig(): ServeConfig {
@@ -63,6 +64,7 @@ function readConfig(): ServeConfig {
     maxBudgetUsd: process.env.MAX_BUDGET_USD,
     depth: Number(process.env.CROSS_PROJECT_BRIDGE_DEPTH ?? 0),
     maxConcurrent: Math.max(1, Number(process.env.MAX_CONCURRENT_QUESTIONS ?? 3)),
+    logFile: process.env.LOG_FILE && process.env.LOG_FILE.length > 0 ? process.env.LOG_FILE : defaultLogFile(),
   };
 }
 
@@ -295,7 +297,7 @@ export async function serve(): Promise<void> {
       `peer=${getPairedPeer() ? `${getPairedPeer()!.label} (fp=${getPairedPeer()!.fingerprint})` : "(unpaired)"} ` +
       `listen=${addr.address}:${actualPort} fp=${ourFp} ` +
       `mdns=${cfg.useMdns ? "on" : "off"} allowedTools=[${cfg.allowedTools}] ` +
-      `maxConcurrent=${cfg.maxConcurrent} depth=${cfg.depth}`
+      `maxConcurrent=${cfg.maxConcurrent} log=${cfg.logFile} depth=${cfg.depth}`
   );
 
   const shutdown = (): void => {
@@ -372,6 +374,9 @@ async function handleIncoming(
         model: cfg.model,
         maxBudgetUsd: cfg.maxBudgetUsd,
         depth: cfg.depth,
+        logFile: cfg.logFile,
+        peerLabel: peer.label,
+        questionId: req.id,
       });
       resp = { type: "ok", id: req.id, answer };
       log("info", `[${peer.label}] a=${req.id} (${answer.length} chars)`);

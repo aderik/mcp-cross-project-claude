@@ -1,6 +1,6 @@
 {
   "name": "mcp-cross-project-claude",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Encrypted LAN bridge between two Claude Code projects: ask read-only questions across project boundaries (and across machines) without pulling the other project's source into the caller's context.",
   "type": "module",
   "bin": {

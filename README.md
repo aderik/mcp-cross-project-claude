@@ -123,6 +123,7 @@ own path; the bridge then has independent state for each.
 | `MODEL`                     | (Claude default)   | Override the spawned session's model.                                |
 | `MAX_BUDGET_USD`            | (no cap)           | Per-call spend cap. Forwarded to `claude --max-budget-usd`.          |
 | `MAX_CONCURRENT_QUESTIONS`  | `3`                | Cap on simultaneous `claude -p` spawns answered by this bridge.      |
+| `LOG_FILE`                  | XDG state dir      | Per-call log: each tool call, result, cost. `tail -f` for live progress. |
 
 ## Security model
 
@@ -168,6 +169,42 @@ claude -p \
 requires `ANTHROPIC_API_KEY`, which breaks Max-plan auth. Non-bare keeps the
 project's `CLAUDE.md` in scope, which is the right place for any project-
 specific answering posture or constraints.
+
+## Observability
+
+The answering side writes a one-line log entry per claude-p event to
+`$XDG_STATE_HOME/mcp-cross-project-claude/bridge.log` (default
+`~/.local/state/mcp-cross-project-claude/bridge.log`). Override with `LOG_FILE`.
+
+Each row carries timestamp, peer label, short question id, and what happened:
+spawn, model, every `tool_use` with its arguments, every `tool_result`
+(truncated), assistant text snippets, and the final `result` line with
+duration + cost. Tail it to watch a long-running query in real time:
+
+```bash
+tail -f ~/.local/state/mcp-cross-project-claude/bridge.log
+```
+
+This visibility lives on the **answering** side — you see what work _your_
+bridge is doing for an incoming peer query. The asking side doesn't see it
+live; it just waits for the final text answer.
+
+## Long-running queries
+
+For deep domain questions, `claude -p` can easily exceed the 180s default
+timeout. Bump it on **both** sides — the asker waits
+`SESSION_TIMEOUT_MS + CLAUDE_TIMEOUT_MS` for the answer frame, so the lower
+of the two is the hard ceiling:
+
+```bash
+claude mcp add cross-project --scope user \
+  -e LISTEN_PORT=53991 -e CLAUDE_TIMEOUT_MS=1200000 \
+  -- npx -y mcp-cross-project-claude
+```
+
+On a Max-plan account, calls hit the plan's 5-hour usage window quota, not
+direct $-billing. The log file's cost field is informational (per-call
+USD-equivalent). `MAX_BUDGET_USD` only applies to API-key auth, not Max.
 
 ## Verification
 
