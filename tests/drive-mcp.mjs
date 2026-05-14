@@ -1,5 +1,5 @@
 // Drive the bridge's MCP stdio interface as a minimal client.
-// Sends initialize, then tools/call with the question, prints the result.
+// Sends initialize, then tools/call ask_cross_project with the question.
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -14,23 +14,23 @@ if (!question) {
   process.exit(2);
 }
 
+const TOOL_NAME = "ask_cross_project";
+
+// Identity (label, peer) lives in STATE_DIR. The bridge uses cwd as
+// project dir, so we run it from BRIDGE_CWD.
+const BRIDGE_CWD = process.env.BRIDGE_CWD ?? `${WORKDIR}/project-b`;
 const env = {
   ...process.env,
-  STATE_DIR: process.env.DRIVER_STATE_DIR ?? `${WORKDIR}/state-b`,
-  PROJECT_DIR: process.env.DRIVER_PROJECT_DIR ?? `${WORKDIR}/new-project`,
-  PROJECT_LABEL: process.env.DRIVER_PROJECT_LABEL ?? "new-accelerate",
-  PEER_LABEL: process.env.DRIVER_PEER_LABEL ?? "legacy-accelerate",
-  TOOL_NAME: process.env.DRIVER_TOOL_NAME ?? "ask_legacy",
-  POSTURE_PRESET: process.env.DRIVER_POSTURE_PRESET ?? "new",
-  LISTEN_PORT: process.env.DRIVER_LISTEN_PORT ?? "53992",
-  PEER_HOST: process.env.DRIVER_PEER_HOST ?? "127.0.0.1",
-  PEER_PORT: process.env.DRIVER_PEER_PORT ?? "53991",
+  STATE_DIR: process.env.BRIDGE_STATE_DIR ?? `${WORKDIR}/state-b`,
+  LISTEN_PORT: process.env.BRIDGE_LISTEN_PORT ?? "53992",
+  PEER_HOST: process.env.BRIDGE_PEER_HOST ?? "127.0.0.1",
+  PEER_PORT: process.env.BRIDGE_PEER_PORT ?? "53991",
   NO_MDNS: "1",
   CLAUDE_TIMEOUT_MS: process.env.CLAUDE_TIMEOUT_MS ?? "180000",
 };
 
-const TOOL_NAME = env.TOOL_NAME;
 const proc = spawn("node", [`${REPO_DIR}/dist/index.js`, "serve"], {
+  cwd: BRIDGE_CWD,
   env,
   stdio: ["pipe", "pipe", "inherit"],
 });
@@ -54,7 +54,7 @@ proc.stdout.on("data", (chunk) => {
         if (msg.error) reject(new Error(JSON.stringify(msg.error)));
         else resolve(msg.result);
       }
-    } catch (e) {
+    } catch {
       console.error("non-JSON line from bridge stdout:", line);
     }
   }
@@ -62,8 +62,7 @@ proc.stdout.on("data", (chunk) => {
 
 function send(method, params) {
   const id = nextId++;
-  const msg = { jsonrpc: "2.0", id, method, params };
-  proc.stdin.write(JSON.stringify(msg) + "\n");
+  proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
   });

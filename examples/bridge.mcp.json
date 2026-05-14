@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cross-project": {
+      "command": "npx",
+      "args": ["-y", "@aderik/mcp-cross-project-claude", "serve"]
+    }
+  }
+}

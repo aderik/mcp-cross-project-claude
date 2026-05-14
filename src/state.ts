@@ -1,8 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-// noise-handshake's dh module exposes X25519 keypair generation (sodium-universal underneath).
-// We use it directly so our long-term static key matches the curve used by the handshake.
+import { basename, dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { generateKeyPair } from "noise-handshake/dh.js";
 import { ensureBuffer, fingerprint } from "./util.js";
 
@@ -18,14 +17,23 @@ export interface PairedPeer {
   pairedAt: string;
 }
 
-export interface State {
+interface StateV2 {
+  version: 2;
+  label: string;
+  static: { publicKey: string; secretKey: string };
+  peer: PairedPeer | null;
+}
+
+// Tolerated when reading from disk; converted on first load.
+interface StateV1 {
   version: 1;
   static: { publicKey: string; secretKey: string };
   peers: PairedPeer[];
 }
 
+type AnyState = StateV1 | StateV2;
+
 function defaultStateDir(): string {
-  // XDG-style: $XDG_CONFIG_HOME or ~/.config
   const xdg = process.env.XDG_CONFIG_HOME;
   if (xdg && xdg.length > 0) return join(xdg, "mcp-cross-project-claude");
   return join(homedir(), ".config", "mcp-cross-project-claude");
@@ -37,30 +45,61 @@ export function statePath(): string {
   return join(dir, "state.json");
 }
 
-function readOrInit(): State {
-  const path = statePath();
-  if (!existsSync(path)) {
-    const kp = generateKeyPair() as { publicKey: Uint8Array; secretKey: Uint8Array };
-    const initial: State = {
-      version: 1,
-      static: {
-        publicKey: ensureBuffer(kp.publicKey).toString("base64"),
-        secretKey: ensureBuffer(kp.secretKey).toString("base64"),
-      },
-      peers: [],
-    };
-    writeState(initial);
-    return initial;
-  }
-  const txt = readFileSync(path, "utf8");
-  const parsed = JSON.parse(txt) as State;
-  if (parsed.version !== 1) {
-    throw new Error(`Unsupported state file version: ${parsed.version}`);
-  }
-  return parsed;
+function shortRandomSuffix(): string {
+  return randomBytes(2).toString("hex"); // 4 hex chars
 }
 
-export function writeState(s: State): void {
+function freshLabel(): string {
+  // Basename of cwd at first init + 4-hex random suffix. Persistent thereafter.
+  const base = basename(process.cwd()) || "bridge";
+  // Strip anything that's not [a-zA-Z0-9_-]
+  const safe = base.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "bridge";
+  return `${safe}-${shortRandomSuffix()}`;
+}
+
+function initialState(): StateV2 {
+  const kp = generateKeyPair() as { publicKey: Uint8Array; secretKey: Uint8Array };
+  return {
+    version: 2,
+    label: freshLabel(),
+    static: {
+      publicKey: ensureBuffer(kp.publicKey).toString("base64"),
+      secretKey: ensureBuffer(kp.secretKey).toString("base64"),
+    },
+    peer: null,
+  };
+}
+
+function migrate(s: AnyState): StateV2 {
+  if (s.version === 2) return s;
+  if (s.version === 1) {
+    return {
+      version: 2,
+      label: freshLabel(),
+      static: s.static,
+      peer: s.peers.length > 0 ? s.peers[0] : null,
+    };
+  }
+  throw new Error(`Unsupported state file version: ${(s as { version: unknown }).version}`);
+}
+
+function readOrInit(): StateV2 {
+  const path = statePath();
+  if (!existsSync(path)) {
+    const fresh = initialState();
+    writeState(fresh);
+    return fresh;
+  }
+  const txt = readFileSync(path, "utf8");
+  const parsed = JSON.parse(txt) as AnyState;
+  const migrated = migrate(parsed);
+  if (parsed.version !== migrated.version) {
+    writeState(migrated);
+  }
+  return migrated;
+}
+
+export function writeState(s: StateV2): void {
   const path = statePath();
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -68,12 +107,16 @@ export function writeState(s: State): void {
   try {
     chmodSync(path, 0o600);
   } catch {
-    // best-effort; non-fatal on filesystems that don't support chmod
+    // best-effort
   }
 }
 
-export function loadState(): State {
+export function loadState(): StateV2 {
   return readOrInit();
+}
+
+export function ourLabel(): string {
+  return loadState().label;
 }
 
 export function ourKeypair(): StaticKeypair {
@@ -84,41 +127,38 @@ export function ourKeypair(): StaticKeypair {
   };
 }
 
-export function listPeers(): PairedPeer[] {
-  return loadState().peers;
+export function getPairedPeer(): PairedPeer | null {
+  return loadState().peer;
 }
 
-export function findPeerByLabel(label: string): PairedPeer | undefined {
-  return listPeers().find((p) => p.label === label);
-}
-
-export function findPeerByPublicKey(pub: Buffer): PairedPeer | undefined {
-  const b64 = pub.toString("base64");
-  return listPeers().find((p) => p.publicKey === b64);
-}
-
-export function addPeer(label: string, publicKey: Buffer): PairedPeer {
+export function setPairedPeer(label: string, publicKey: Buffer): PairedPeer {
   const s = loadState();
-  const existing = s.peers.findIndex((p) => p.label === label);
+  if (s.peer !== null) {
+    throw new Error(
+      `Already paired with "${s.peer.label}" (fp=${s.peer.fingerprint}). Run \`unpair\` first.`
+    );
+  }
   const entry: PairedPeer = {
     label,
     publicKey: publicKey.toString("base64"),
     fingerprint: fingerprint(publicKey),
     pairedAt: new Date().toISOString(),
   };
-  if (existing >= 0) {
-    s.peers[existing] = entry;
-  } else {
-    s.peers.push(entry);
-  }
+  s.peer = entry;
   writeState(s);
   return entry;
 }
 
-export function removePeer(label: string): boolean {
+export function clearPairedPeer(): boolean {
   const s = loadState();
-  const before = s.peers.length;
-  s.peers = s.peers.filter((p) => p.label !== label);
+  if (s.peer === null) return false;
+  s.peer = null;
   writeState(s);
-  return s.peers.length !== before;
+  return true;
+}
+
+export function findPeerByPublicKey(pub: Buffer): PairedPeer | null {
+  const peer = getPairedPeer();
+  if (!peer) return null;
+  return peer.publicKey === pub.toString("base64") ? peer : null;
 }

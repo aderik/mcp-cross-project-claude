@@ -1,21 +1,31 @@
 import { createServer, createConnection } from "node:net";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { addPeer, ourKeypair } from "./state.js";
+import { getPairedPeer, ourKeypair, ourLabel, setPairedPeer } from "./state.js";
 import { advertise, findPeerByLabel, SERVICE_TYPE_PAIR } from "./mdns.js";
 import { FramedSocket, pairInitiator, pairResponder } from "./transport.js";
-import { log, pinToPsk, randomPin, fingerprint } from "./util.js";
+import { fingerprint, log, pinToPsk, randomPin } from "./util.js";
 
 const PAIR_HANDSHAKE_TIMEOUT_MS = 10_000;
 const PAIR_WINDOW_MS = 60_000;
-const PAIR_DEFAULT_PORT = 0; // ephemeral
+
+function refuseIfAlreadyPaired(): void {
+  const existing = getPairedPeer();
+  if (existing) {
+    throw new Error(
+      `Already paired with "${existing.label}" (fp=${existing.fingerprint}). Run \`unpair\` first.`
+    );
+  }
+}
 
 /**
- * Run on the receiving side. Displays a PIN, opens a listener that accepts
- * exactly ONE pairing attempt, runs XXpsk0 handshake, on success exchanges
- * labels and persists the peer. Single-use PIN.
+ * Receiver: shows a one-time PIN and waits for one pairing attempt. On
+ * success, persists the peer. Single-use PIN; the window closes after the
+ * first attempt regardless of outcome.
  */
-export async function pairReceive(opts: { ourLabel: string; useMdns: boolean; bindHost?: string }): Promise<void> {
+export async function pairReceive(opts: { useMdns: boolean; bindHost?: string }): Promise<void> {
+  refuseIfAlreadyPaired();
+  const label = ourLabel();
   const pin = randomPin();
   const psk = pinToPsk(pin);
   const kp = ourKeypair();
@@ -23,7 +33,7 @@ export async function pairReceive(opts: { ourLabel: string; useMdns: boolean; bi
 
   const server = createServer();
   await new Promise<void>((res) => {
-    server.listen({ port: PAIR_DEFAULT_PORT, host: opts.bindHost ?? "0.0.0.0" }, res);
+    server.listen({ port: 0, host: opts.bindHost ?? "0.0.0.0" }, res);
   });
   const addr = server.address();
   if (!addr || typeof addr === "string") {
@@ -36,7 +46,7 @@ export async function pairReceive(opts: { ourLabel: string; useMdns: boolean; bi
     try {
       advert = advertise({
         serviceType: SERVICE_TYPE_PAIR,
-        label: opts.ourLabel,
+        label,
         fingerprint: ourFp,
         port,
       });
@@ -49,13 +59,14 @@ export async function pairReceive(opts: { ourLabel: string; useMdns: boolean; bi
   console.log("=========================================================");
   console.log(`  Pairing PIN:  ${pin}`);
   console.log("=========================================================");
-  console.log(`  Our label:    ${opts.ourLabel}`);
+  console.log(`  Our label:    ${label}`);
+  console.log(`  Our fp:       ${ourFp}`);
   console.log(`  Listening:    ${addr.address}:${port}`);
   console.log(`  mDNS:         ${opts.useMdns ? `_${SERVICE_TYPE_PAIR}._tcp.local` : "disabled"}`);
   console.log(`  Window:       ${PAIR_WINDOW_MS / 1000}s (single attempt)`);
   console.log("");
   console.log("On the OTHER machine, run:");
-  console.log(`  npx -y @aderik/mcp-cross-project-claude pair-send ${opts.ourLabel} --pin ${pin}`);
+  console.log(`  npx -y @aderik/mcp-cross-project-claude pair-send --peer-label ${label} --pin ${pin}`);
   console.log("");
 
   let attempted = false;
@@ -80,15 +91,13 @@ export async function pairReceive(opts: { ourLabel: string; useMdns: boolean; bi
       const framed = new FramedSocket(socket);
       try {
         const channel = await pairResponder(framed, kp, psk, PAIR_HANDSHAKE_TIMEOUT_MS);
-        // Exchange labels over the encrypted channel.
-        // Responder receives the initiator's label payload first, then sends ours.
         const peerPayloadRaw = await channel.recv(PAIR_HANDSHAKE_TIMEOUT_MS);
         const peerPayload = JSON.parse(peerPayloadRaw.toString("utf8")) as { label: string };
         if (!peerPayload.label || typeof peerPayload.label !== "string") {
           throw new Error("Peer sent invalid label payload");
         }
-        channel.send(Buffer.from(JSON.stringify({ label: opts.ourLabel }), "utf8"));
-        const peerEntry = addPeer(peerPayload.label, channel.remoteStatic);
+        channel.send(Buffer.from(JSON.stringify({ label }), "utf8"));
+        const peerEntry = setPairedPeer(peerPayload.label, channel.remoteStatic);
         channel.close();
         cleanup();
         console.log("");
@@ -108,18 +117,20 @@ export async function pairReceive(opts: { ourLabel: string; useMdns: boolean; bi
 }
 
 /**
- * Run on the sending side. Discovers the receiver via mDNS (or uses --host),
- * prompts for PIN if not provided, runs XXpsk0 as initiator, on success
- * exchanges labels and persists the peer.
+ * Sender: discovers the receiver (or connects to --host/--port), runs the
+ * XXpsk0 handshake with PIN-derived PSK, persists the peer on success.
+ * Hard-errors if the receiver claims a different label than --peer-label.
  */
 export async function pairSend(opts: {
-  ourLabel: string;
   peerLabel: string;
   pin?: string;
   host?: string;
   port?: number;
   useMdns: boolean;
 }): Promise<void> {
+  refuseIfAlreadyPaired();
+  const label = ourLabel();
+
   let host = opts.host;
   let port = opts.port;
   if (!host || !port) {
@@ -152,16 +163,21 @@ export async function pairSend(opts: {
   const framed = new FramedSocket(socket);
   const channel = await pairInitiator(framed, kp, psk, PAIR_HANDSHAKE_TIMEOUT_MS);
 
-  channel.send(Buffer.from(JSON.stringify({ label: opts.ourLabel }), "utf8"));
+  channel.send(Buffer.from(JSON.stringify({ label }), "utf8"));
   const peerPayloadRaw = await channel.recv(PAIR_HANDSHAKE_TIMEOUT_MS);
   const peerPayload = JSON.parse(peerPayloadRaw.toString("utf8")) as { label: string };
   if (!peerPayload.label || typeof peerPayload.label !== "string") {
     throw new Error("Peer sent invalid label payload");
   }
   if (peerPayload.label !== opts.peerLabel) {
-    log("warn", `Peer claimed label "${peerPayload.label}" but we expected "${opts.peerLabel}". Using the claimed label.`);
+    channel.close();
+    throw new Error(
+      `Label mismatch: expected "${opts.peerLabel}" but the peer at ${host}:${port} ` +
+        `identifies as "${peerPayload.label}". Refusing to pair — another machine may ` +
+        `be impersonating the label.`
+    );
   }
-  const peerEntry = addPeer(peerPayload.label, channel.remoteStatic);
+  const peerEntry = setPairedPeer(peerPayload.label, channel.remoteStatic);
   channel.close();
   console.log("");
   console.log("Pairing succeeded.");

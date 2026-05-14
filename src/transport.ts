@@ -28,9 +28,16 @@ const CipherClass = Cipher as unknown as CipherCtor;
 export const PROLOGUE_PAIR = Buffer.from("mcp-cross-project-claude/pair/v1");
 export const PROLOGUE_SESSION = Buffer.from("mcp-cross-project-claude/session/v1");
 
+// 4-byte big-endian length prefix; hard cap protects against a malicious peer
+// sending a frame that would exhaust memory before we can decrypt it.
+const FRAME_HEADER_BYTES = 4;
+export const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB
+// Noise specifies a hard max of 65535 bytes per encrypted message (incl. tag).
+const NOISE_MAX_CIPHERTEXT = 65535;
+const POLY1305_TAG_BYTES = 16;
+const NOISE_MAX_PLAINTEXT = NOISE_MAX_CIPHERTEXT - POLY1305_TAG_BYTES; // 65519
+
 // ---------- Framing on the wire ----------
-// Each message on the socket is: 2-byte big-endian length, then `length` bytes.
-// Used for both handshake messages and post-handshake encrypted frames.
 
 export class FramedSocket {
   private buf: Buffer = Buffer.alloc(0);
@@ -58,11 +65,22 @@ export class FramedSocket {
   }
 
   private drain(): void {
-    while (this.waiters.length > 0 && this.buf.length >= 2) {
-      const len = this.buf.readUInt16BE(0);
-      if (this.buf.length < 2 + len) return;
-      const frame = this.buf.subarray(2, 2 + len);
-      this.buf = this.buf.subarray(2 + len);
+    while (this.waiters.length > 0 && this.buf.length >= FRAME_HEADER_BYTES) {
+      const len = this.buf.readUInt32BE(0);
+      if (len > MAX_FRAME_BYTES) {
+        const err = new Error(`Frame length ${len} exceeds maximum ${MAX_FRAME_BYTES}`);
+        this.error = err;
+        for (const w of this.waiters) {
+          if (w.timer) clearTimeout(w.timer);
+          w.reject(err);
+        }
+        this.waiters = [];
+        this.socket.destroy();
+        return;
+      }
+      if (this.buf.length < FRAME_HEADER_BYTES + len) return;
+      const frame = this.buf.subarray(FRAME_HEADER_BYTES, FRAME_HEADER_BYTES + len);
+      this.buf = this.buf.subarray(FRAME_HEADER_BYTES + len);
       const w = this.waiters.shift()!;
       if (w.timer) clearTimeout(w.timer);
       w.resolve(Buffer.from(frame));
@@ -71,9 +89,9 @@ export class FramedSocket {
 
   send(frame: Buffer | Uint8Array): void {
     const b = ensureBuffer(frame);
-    if (b.length > 65535) throw new Error(`Frame too large: ${b.length} bytes`);
-    const header = Buffer.alloc(2);
-    header.writeUInt16BE(b.length, 0);
+    if (b.length > MAX_FRAME_BYTES) throw new Error(`Frame too large: ${b.length} > ${MAX_FRAME_BYTES}`);
+    const header = Buffer.alloc(FRAME_HEADER_BYTES);
+    header.writeUInt32BE(b.length, 0);
     this.socket.write(Buffer.concat([header, b]));
   }
 
@@ -103,33 +121,62 @@ export class FramedSocket {
 // ---------- Handshakes ----------
 
 export interface SecureChannel {
-  framed: FramedSocket;
-  txCipher: { encrypt(p: Uint8Array): Uint8Array };
-  rxCipher: { decrypt(c: Uint8Array): Uint8Array };
   remoteStatic: Buffer;
   send(payload: Buffer): void;
   recv(timeoutMs: number): Promise<Buffer>;
   close(): void;
 }
 
+interface ChannelCipher {
+  encrypt(p: Uint8Array): Uint8Array;
+  decrypt(c: Uint8Array): Uint8Array;
+}
+
 function wrap(framed: FramedSocket, hs: NoiseHandshake): SecureChannel {
-  const txCipher = new CipherClass(hs.tx);
-  const rxCipher = new CipherClass(hs.rx);
+  const txCipher: ChannelCipher = new CipherClass(hs.tx);
+  const rxCipher: ChannelCipher = new CipherClass(hs.rx);
   const remoteStatic = ensureBuffer(hs.rs!);
   return {
-    framed,
-    txCipher,
-    rxCipher,
     remoteStatic,
+
+    // Application payloads can exceed Noise's 65535-byte ciphertext limit.
+    // Chunk into NOISE_MAX_PLAINTEXT-sized pieces, encrypt each separately
+    // (each piece consumes one nonce), concatenate, and wrap in one framed
+    // message on the wire. The receiver splits at NOISE_MAX_CIPHERTEXT
+    // boundaries; every chunk except the last is exactly that size, so no
+    // per-chunk length needed.
     send(payload: Buffer): void {
-      const ct = txCipher.encrypt(payload);
-      framed.send(ct);
+      const parts: Buffer[] = [];
+      if (payload.length === 0) {
+        parts.push(Buffer.from(txCipher.encrypt(payload)));
+      } else {
+        for (let i = 0; i < payload.length; i += NOISE_MAX_PLAINTEXT) {
+          const piece = payload.subarray(i, Math.min(i + NOISE_MAX_PLAINTEXT, payload.length));
+          parts.push(Buffer.from(txCipher.encrypt(piece)));
+        }
+      }
+      const combined = Buffer.concat(parts);
+      framed.send(combined);
     },
+
     async recv(timeoutMs: number): Promise<Buffer> {
-      const ct = await framed.recv(timeoutMs);
-      const pt = rxCipher.decrypt(ct);
-      return ensureBuffer(pt);
+      const combined = await framed.recv(timeoutMs);
+      if (combined.length === 0) {
+        // Should not happen; recv always returns at least the empty-chunk tag.
+        return Buffer.alloc(0);
+      }
+      const parts: Buffer[] = [];
+      let offset = 0;
+      while (offset < combined.length) {
+        const remaining = combined.length - offset;
+        const take = Math.min(NOISE_MAX_CIPHERTEXT, remaining);
+        const slice = combined.subarray(offset, offset + take);
+        parts.push(Buffer.from(rxCipher.decrypt(slice)));
+        offset += take;
+      }
+      return Buffer.concat(parts);
     },
+
     close(): void {
       framed.close();
     },
@@ -137,15 +184,9 @@ function wrap(framed: FramedSocket, hs: NoiseHandshake): SecureChannel {
 }
 
 /**
- * XXpsk0 pairing handshake. Initiator (sender) and responder (receiver) both
- * supply their long-term static keypair and the same PIN-derived PSK. After
- * three messages both sides have each other's static public key, and a
- * shared transport-cipher pair.
- *
- * Eavesdropper analysis: the PSK is mixed into the handshake hash before
- * anything else; an attacker can offline-bruteforce the PIN against captured
- * traffic, but cannot derive the ephemeral-ECDH-based session keys without
- * actively having been the peer.
+ * XXpsk0 pairing handshake (mutual exchange of static keys, PSK mixed in
+ * at the start). After three messages both sides know each other's static
+ * pubkey via `hs.rs` and share transport ciphers.
  */
 export async function pairInitiator(
   framed: FramedSocket,
@@ -155,11 +196,8 @@ export async function pairInitiator(
 ): Promise<SecureChannel> {
   const hs = new NoiseClass("XXpsk0", true, { publicKey: staticKeypair.publicKey, secretKey: staticKeypair.secretKey }, { psk });
   hs.initialise(PROLOGUE_PAIR);
-  // XX message 1 (-> e)
   framed.send(Buffer.from(hs.send()));
-  // XX message 2 (<- e, ee, s, es)
   hs.recv(await framed.recv(timeoutMs));
-  // XX message 3 (-> s, se)
   framed.send(Buffer.from(hs.send()));
   if (!hs.complete) throw new Error("Pairing handshake did not complete");
   return wrap(framed, hs);
@@ -181,10 +219,9 @@ export async function pairResponder(
 }
 
 /**
- * IK session handshake. Initiator already knows the responder's static public
- * key (cached from a prior pairing); responder verifies that the static
- * public key the initiator reveals during the handshake matches one of the
- * paired peers.
+ * IK session handshake. Initiator already knows the responder's static
+ * public key (cached from a prior pairing); responder verifies that the
+ * static the initiator reveals during the handshake matches a paired peer.
  */
 export async function sessionInitiator(
   framed: FramedSocket,
@@ -194,9 +231,7 @@ export async function sessionInitiator(
 ): Promise<SecureChannel> {
   const hs = new NoiseClass("IK", true, { publicKey: staticKeypair.publicKey, secretKey: staticKeypair.secretKey });
   hs.initialise(PROLOGUE_SESSION, remoteStatic);
-  // IK message 1 (-> e, es, s, ss)
   framed.send(Buffer.from(hs.send()));
-  // IK message 2 (<- e, ee, se)
   hs.recv(await framed.recv(timeoutMs));
   if (!hs.complete) throw new Error("Session handshake did not complete");
   return wrap(framed, hs);
@@ -221,16 +256,8 @@ export interface AskRequest {
   type: "ask";
   id: string;
   question: string;
-  asker_label: string;
 }
 
 export type AskResponse =
   | { type: "ok"; id: string; answer: string }
   | { type: "err"; id: string; message: string };
-
-export interface PairExchange {
-  label: string;
-  // The static public key is implicit in the Noise handshake (peer.rs), so we
-  // do not include it in the application payload — that would be redundant
-  // and a potential desync source. We only exchange the label.
-}

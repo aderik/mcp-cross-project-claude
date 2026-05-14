@@ -3,20 +3,23 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createServer, createConnection } from "node:net";
 import { randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
-import { resolve } from "node:path";
-import { advertise, findPeerByLabel, SERVICE_TYPE_SESSION, shutdownMdns } from "./mdns.js";
-import { findPeerByLabel as findPairedPeerByLabel, findPeerByPublicKey, ourKeypair } from "./state.js";
+import { advertise, findPeerByFingerprint, SERVICE_TYPE_SESSION, shutdownMdns } from "./mdns.js";
+import {
+  findPeerByPublicKey,
+  getPairedPeer,
+  ourKeypair,
+  ourLabel,
+} from "./state.js";
 import { FramedSocket, sessionInitiator, sessionResponder } from "./transport.js";
 import type { AskRequest, AskResponse, SecureChannel } from "./transport.js";
-import { resolvePosture, runClaudeQuestion } from "./engine.js";
+import { runClaudeQuestion } from "./engine.js";
+import { Semaphore } from "./semaphore.js";
 import { fingerprint, log } from "./util.js";
+
+export const TOOL_NAME = "ask_cross_project";
 
 interface ServeConfig {
   projectDir: string;
-  projectLabel: string;
-  toolName: string;
-  peerLabel: string;
   listenPort: number;
   listenHost: string;
   useMdns: boolean;
@@ -29,35 +32,25 @@ interface ServeConfig {
   model?: string;
   maxBudgetUsd?: string;
   depth: number;
+  maxConcurrent: number;
 }
 
 function readConfig(): ServeConfig {
-  const required = (name: string): string => {
-    const v = process.env[name];
-    if (!v || v.length === 0) throw new Error(`${name} env var is required`);
-    return v;
-  };
-  const PROJECT_DIR = resolve(required("PROJECT_DIR"));
-  if (!existsSync(PROJECT_DIR) || !statSync(PROJECT_DIR).isDirectory()) {
-    throw new Error(`PROJECT_DIR does not exist or is not a directory: ${PROJECT_DIR}`);
-  }
   return {
-    projectDir: PROJECT_DIR,
-    projectLabel: required("PROJECT_LABEL"),
-    toolName: process.env.TOOL_NAME ?? "ask_peer",
-    peerLabel: required("PEER_LABEL"),
+    projectDir: process.cwd(),
     listenPort: Number(process.env.LISTEN_PORT ?? 0),
     listenHost: process.env.LISTEN_HOST ?? "0.0.0.0",
     useMdns: process.env.NO_MDNS !== "1",
     peerHost: process.env.PEER_HOST,
     peerPort: process.env.PEER_PORT ? Number(process.env.PEER_PORT) : undefined,
     sessionTimeoutMs: Number(process.env.SESSION_TIMEOUT_MS ?? 30_000),
-    claudeTimeoutMs: Number(process.env.CLAUDE_TIMEOUT_MS ?? process.env.TIMEOUT_MS ?? 180_000),
+    claudeTimeoutMs: Number(process.env.CLAUDE_TIMEOUT_MS ?? 180_000),
     claudeBin: process.env.CLAUDE_BIN ?? "claude",
     allowedTools: process.env.ALLOWED_TOOLS ?? "Read,Grep,Glob",
     model: process.env.MODEL,
     maxBudgetUsd: process.env.MAX_BUDGET_USD,
     depth: Number(process.env.CROSS_PROJECT_BRIDGE_DEPTH ?? 0),
+    maxConcurrent: Math.max(1, Number(process.env.MAX_CONCURRENT_QUESTIONS ?? 3)),
   };
 }
 
@@ -70,14 +63,16 @@ export async function serve(): Promise<void> {
     );
   }
 
-  const { posture, source: postureSource } = resolvePosture();
   const kp = ourKeypair();
+  const label = ourLabel();
   const ourFp = fingerprint(kp.publicKey);
+  const peer = getPairedPeer();
+  const semaphore = new Semaphore(cfg.maxConcurrent);
 
   // ---------- TCP listener (incoming peer questions) ----------
   const tcpServer = createServer();
   tcpServer.on("connection", (socket) => {
-    handleIncoming(socket, cfg, posture).catch((err) => {
+    handleIncoming(socket, cfg, semaphore).catch((err) => {
       log("warn", `Incoming session ended with error: ${(err as Error).message}`);
     });
   });
@@ -96,7 +91,7 @@ export async function serve(): Promise<void> {
     try {
       advert = advertise({
         serviceType: SERVICE_TYPE_SESSION,
-        label: cfg.projectLabel,
+        label,
         fingerprint: ourFp,
         port: actualPort,
       });
@@ -108,8 +103,8 @@ export async function serve(): Promise<void> {
   // ---------- MCP stdio server (local AI client) ----------
   const mcp = new Server(
     {
-      name: `cross-project-claude:${cfg.projectLabel}`,
-      version: "0.2.0",
+      name: `cross-project-claude:${label}`,
+      version: "0.3.0",
     },
     { capabilities: { tools: {} } }
   );
@@ -117,19 +112,19 @@ export async function serve(): Promise<void> {
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
-        name: cfg.toolName,
+        name: TOOL_NAME,
         description:
-          `Ask a question to a read-only Claude Code agent running on a peer machine that hosts ` +
-          `the "${cfg.peerLabel}" project. The peer answers in text only; it can read its own ` +
-          `project files but cannot modify them, and cannot see anything in this project. Use ` +
-          `this to gather factual context from the other side of a migration without pulling ` +
-          `that project's source into the current conversation. Be specific in your question.`,
+          `Ask a question to a read-only Claude Code agent running in a paired project on ` +
+          `another machine (or another directory on this machine). The agent can read its own ` +
+          `project files and answer in text, but cannot modify them and cannot see anything in ` +
+          `the calling project. Use this to gather factual context from another project without ` +
+          `pulling its source into the current conversation. Be specific in your question.`,
         inputSchema: {
           type: "object",
           properties: {
             question: {
               type: "string",
-              description: "The question to ask the peer. Self-contained and specific.",
+              description: "The question to ask the paired peer. Self-contained and specific.",
             },
           },
           required: ["question"],
@@ -140,7 +135,7 @@ export async function serve(): Promise<void> {
   }));
 
   mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params.name !== cfg.toolName) {
+    if (request.params.name !== TOOL_NAME) {
       return { content: [{ type: "text", text: `Unknown tool: ${request.params.name}` }], isError: true };
     }
     const args = request.params.arguments ?? {};
@@ -162,10 +157,11 @@ export async function serve(): Promise<void> {
 
   log(
     "info",
-    `ready. project=${cfg.projectLabel} dir=${cfg.projectDir} tool=${cfg.toolName} ` +
-      `peer=${cfg.peerLabel} listen=${addr.address}:${actualPort} fp=${ourFp} ` +
-      `mdns=${cfg.useMdns ? "on" : "off"} posture=${postureSource} ` +
-      `allowedTools=[${cfg.allowedTools}] depth=${cfg.depth}`
+    `ready. label=${label} cwd=${cfg.projectDir} ` +
+      `peer=${peer ? `${peer.label} (fp=${peer.fingerprint})` : "(unpaired)"} ` +
+      `listen=${addr.address}:${actualPort} fp=${ourFp} ` +
+      `mdns=${cfg.useMdns ? "on" : "off"} allowedTools=[${cfg.allowedTools}] ` +
+      `maxConcurrent=${cfg.maxConcurrent} depth=${cfg.depth}`
   );
 
   const shutdown = (): void => {
@@ -183,7 +179,7 @@ export async function serve(): Promise<void> {
 async function handleIncoming(
   socket: import("node:net").Socket,
   cfg: ServeConfig,
-  posture: string | null
+  semaphore: Semaphore
 ): Promise<void> {
   const framed = new FramedSocket(socket);
   const kp = ourKeypair();
@@ -195,7 +191,6 @@ async function handleIncoming(
     socket.destroy();
     return;
   }
-  // Authenticate: peer's revealed static must be in our paired-peers list.
   const peer = findPeerByPublicKey(channel.remoteStatic);
   if (!peer) {
     log("warn", `Incoming connection from unknown public key fp=${fingerprint(channel.remoteStatic)} — closing`);
@@ -225,18 +220,22 @@ async function handleIncoming(
 
   let resp: AskResponse;
   try {
-    const answer = await runClaudeQuestion(req.question, {
-      projectDir: cfg.projectDir,
-      posture,
-      allowedTools: cfg.allowedTools,
-      timeoutMs: cfg.claudeTimeoutMs,
-      claudeBin: cfg.claudeBin,
-      model: cfg.model,
-      maxBudgetUsd: cfg.maxBudgetUsd,
-      depth: cfg.depth,
-    });
-    resp = { type: "ok", id: req.id, answer };
-    log("info", `[${peer.label}] a=${req.id} (${answer.length} chars)`);
+    await semaphore.acquire(cfg.sessionTimeoutMs);
+    try {
+      const answer = await runClaudeQuestion(req.question, {
+        projectDir: cfg.projectDir,
+        allowedTools: cfg.allowedTools,
+        timeoutMs: cfg.claudeTimeoutMs,
+        claudeBin: cfg.claudeBin,
+        model: cfg.model,
+        maxBudgetUsd: cfg.maxBudgetUsd,
+        depth: cfg.depth,
+      });
+      resp = { type: "ok", id: req.id, answer };
+      log("info", `[${peer.label}] a=${req.id} (${answer.length} chars)`);
+    } finally {
+      semaphore.release();
+    }
   } catch (err) {
     resp = { type: "err", id: req.id, message: (err as Error).message };
     log("warn", `[${peer.label}] error answering ${req.id}: ${resp.message}`);
@@ -248,28 +247,19 @@ async function handleIncoming(
 // ---------- Outgoing: local AI asked us, we ask the peer ----------
 
 async function askPeer(question: string, cfg: ServeConfig): Promise<string> {
-  const peer = findPairedPeerByLabel(cfg.peerLabel);
+  const peer = getPairedPeer();
   if (!peer) {
-    throw new Error(
-      `No paired peer with label "${cfg.peerLabel}". Run pair-send/pair-receive on both ends first.`
-    );
+    throw new Error("No paired peer. Run `pair-receive` on one side and `pair-send` on the other.");
   }
   let host = cfg.peerHost;
   let port = cfg.peerPort;
   if (!host || !port) {
     if (!cfg.useMdns) {
-      throw new Error("No PEER_HOST/PEER_PORT set and mDNS disabled — cannot route question");
+      throw new Error("No PEER_HOST/PEER_PORT set and mDNS disabled — cannot route question.");
     }
-    const discovered = await findPeerByLabel(SERVICE_TYPE_SESSION, cfg.peerLabel, 5_000);
+    const discovered = await findPeerByFingerprint(SERVICE_TYPE_SESSION, peer.fingerprint, 5_000);
     host = discovered.addresses[0] ?? discovered.host;
     port = discovered.port;
-    if (discovered.fingerprint !== peer.fingerprint) {
-      throw new Error(
-        `mDNS advertisement for "${cfg.peerLabel}" has fingerprint ${discovered.fingerprint} ` +
-          `but the paired peer has fingerprint ${peer.fingerprint}. Refusing to connect — ` +
-          `another machine may be claiming this label.`
-      );
-    }
   }
   const socket = createConnection({ host, port });
   await new Promise<void>((res, rej) => {
@@ -284,7 +274,6 @@ async function askPeer(question: string, cfg: ServeConfig): Promise<string> {
     type: "ask",
     id: randomUUID(),
     question,
-    asker_label: cfg.projectLabel,
   };
   channel.send(Buffer.from(JSON.stringify(req), "utf8"));
   const respRaw = await channel.recv(cfg.sessionTimeoutMs + cfg.claudeTimeoutMs);

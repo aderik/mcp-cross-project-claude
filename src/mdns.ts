@@ -69,34 +69,34 @@ function serviceToPeer(s: Service): DiscoveredPeer | null {
 }
 
 /**
- * Browse for a single peer by label, with a timeout. Returns the first matching
- * advertisement. Useful for both pairing (browse SERVICE_TYPE_PAIR) and session
- * routing (browse SERVICE_TYPE_SESSION).
+ * Browse for a peer with a matching predicate, with a timeout. Used for both
+ * pairing (match by label, since fingerprint isn't known yet) and session
+ * routing (match by fingerprint, which is the stable identity).
  */
-export function findPeerByLabel(
+function findPeer(
   serviceType: typeof SERVICE_TYPE_SESSION | typeof SERVICE_TYPE_PAIR,
-  label: string,
+  match: (p: DiscoveredPeer) => boolean,
+  description: string,
   timeoutMs: number
 ): Promise<DiscoveredPeer> {
   return new Promise<DiscoveredPeer>((resolve, reject) => {
     const browser = bonjour().find({ type: serviceType, protocol: "tcp" });
     const timer = setTimeout(() => {
       browser.stop();
-      reject(new Error(`mDNS: did not find a peer named "${label}" within ${timeoutMs}ms`));
+      reject(new Error(`mDNS: did not find ${description} within ${timeoutMs}ms`));
     }, timeoutMs);
     const onUp = (s: Service): void => {
       const peer = serviceToPeer(s);
-      if (peer && peer.label === label) {
+      if (peer && match(peer)) {
         clearTimeout(timer);
         browser.stop();
         resolve(peer);
       }
     };
     browser.on("up", onUp);
-    // Also check anything already seen.
     for (const s of browser.services) {
       const peer = serviceToPeer(s);
-      if (peer && peer.label === label) {
+      if (peer && match(peer)) {
         clearTimeout(timer);
         browser.stop();
         resolve(peer);
@@ -106,22 +106,25 @@ export function findPeerByLabel(
   });
 }
 
-export function listPeers(
+export function findPeerByLabel(
   serviceType: typeof SERVICE_TYPE_SESSION | typeof SERVICE_TYPE_PAIR,
+  label: string,
   timeoutMs: number
-): Promise<DiscoveredPeer[]> {
-  return new Promise<DiscoveredPeer[]>((resolve) => {
-    const browser = bonjour().find({ type: serviceType, protocol: "tcp" });
-    const seen = new Map<string, DiscoveredPeer>();
-    browser.on("up", (s) => {
-      const peer = serviceToPeer(s);
-      if (peer) seen.set(peer.label, peer);
-    });
-    setTimeout(() => {
-      browser.stop();
-      resolve([...seen.values()]);
-    }, timeoutMs);
-  });
+): Promise<DiscoveredPeer> {
+  return findPeer(serviceType, (p) => p.label === label, `peer labelled "${label}"`, timeoutMs);
+}
+
+export function findPeerByFingerprint(
+  serviceType: typeof SERVICE_TYPE_SESSION | typeof SERVICE_TYPE_PAIR,
+  fingerprint: string,
+  timeoutMs: number
+): Promise<DiscoveredPeer> {
+  return findPeer(
+    serviceType,
+    (p) => p.fingerprint === fingerprint,
+    `peer with fingerprint ${fingerprint}`,
+    timeoutMs
+  );
 }
 
 export function shutdownMdns(): void {

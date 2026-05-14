@@ -1,11 +1,7 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 export interface EngineConfig {
   projectDir: string;
-  posture: string | null;
   allowedTools: string;
   timeoutMs: number;
   claudeBin: string;
@@ -14,42 +10,22 @@ export interface EngineConfig {
   depth: number;
 }
 
-export function resolvePosture(): { posture: string | null; source: string } {
-  const POSTURE_FILE = process.env.POSTURE_FILE;
-  const POSTURE_PRESET = process.env.POSTURE_PRESET;
-  if (POSTURE_FILE) {
-    const p = resolve(POSTURE_FILE);
-    if (!existsSync(p)) throw new Error(`POSTURE_FILE not found: ${p}`);
-    return { posture: readFileSync(p, "utf8").trim(), source: p };
-  }
-  if (POSTURE_PRESET) {
-    const map: Record<string, string> = { legacy: "ask-legacy.md", new: "ask-new.md" };
-    const file = map[POSTURE_PRESET];
-    if (!file) throw new Error(`Unknown POSTURE_PRESET="${POSTURE_PRESET}". Valid: legacy, new.`);
-    const __dirname = dirname(fileURLToPath(import.meta.url));
-    const pkgRoot = resolve(__dirname, "..");
-    const p = resolve(pkgRoot, "postures", file);
-    if (!existsSync(p)) throw new Error(`Bundled posture file missing: ${p}`);
-    return { posture: readFileSync(p, "utf8").trim(), source: `preset:${POSTURE_PRESET}` };
-  }
-  return { posture: null, source: "(none)" };
-}
-
 /**
  * Spawn a fresh, ephemeral `claude -p` for one question. Returns the stdout
  * text on success, throws on non-zero exit or timeout.
  *
  * Hard guarantees enforced by the flags here:
  *  - --strict-mcp-config with no --mcp-config ⇒ the spawned session loads zero
- *    MCP servers (no recursion).
- *  - --allowedTools "Read,Grep,Glob" ⇒ no Edit/Write/Bash etc. — answer-only,
- *    read-only.
+ *    MCP servers (primary recursion guard).
+ *  - --allowedTools "Read,Grep,Glob" ⇒ no Edit/Write/Bash etc. — read-only.
  *  - CROSS_PROJECT_BRIDGE_DEPTH is bumped in the env so a misconfigured nested
- *    bridge would refuse to start.
+ *    bridge refuses to start.
  *
  * Deliberately NOT used:
  *  - --bare: would skip OAuth/keychain and require ANTHROPIC_API_KEY. On a Max
- *    plan that breaks auth. Non-bare is intentional.
+ *    plan that breaks auth. Non-bare keeps the project's CLAUDE.md in scope.
+ *  - --append-system-prompt: project-specific answering posture lives in the
+ *    project's CLAUDE.md, not here.
  *  - --no-session-persistence: redundant in -p mode (already non-persistent).
  */
 export function runClaudeQuestion(question: string, cfg: EngineConfig): Promise<string> {
@@ -62,9 +38,6 @@ export function runClaudeQuestion(question: string, cfg: EngineConfig): Promise<
       "--allowedTools",
       cfg.allowedTools,
     ];
-    if (cfg.posture) {
-      args.push("--append-system-prompt", cfg.posture);
-    }
     if (cfg.model) args.push("--model", cfg.model);
     if (cfg.maxBudgetUsd) args.push("--max-budget-usd", cfg.maxBudgetUsd);
 
