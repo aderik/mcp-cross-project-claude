@@ -256,8 +256,28 @@ export interface AskRequest {
   type: "ask";
   id: string;
   question: string;
+  /** Optional per-call timeout for the spawned claude -p on the receiving side.
+   * Receiver clamps to its own MAX_CLAUDE_TIMEOUT_MS for safety. */
+  timeout_ms?: number;
+  /** If true, the receiver may emit intermittent ProgressFrame messages before
+   * the terminal AskOk/AskErr. Asker indicates support; older receivers without
+   * this field send only ok/err and the asker handles both. */
+  wants_progress?: boolean;
 }
 
-export type AskResponse =
+export interface ProgressFrame {
+  type: "progress";
+  id: string;
+  /** Monotonically increasing per-call sequence number. */
+  seq: number;
+  /** Short human-readable summary line (e.g. "tool_use Grep(pattern=foo)"). */
+  message: string;
+  /** Milliseconds since the receiver spawned claude -p. */
+  elapsed_ms: number;
+}
+
+export type TerminalFrame =
   | { type: "ok"; id: string; answer: string }
   | { type: "err"; id: string; message: string };
+
+export type AnswerFrame = ProgressFrame | TerminalFrame;

@@ -12,7 +12,7 @@ import {
   ourLabel,
 } from "./state.js";
 import { FramedSocket, sessionInitiator, sessionResponder } from "./transport.js";
-import type { AskRequest, AskResponse, SecureChannel } from "./transport.js";
+import type { AnswerFrame, AskRequest, ProgressFrame, SecureChannel, TerminalFrame } from "./transport.js";
 import { defaultLogFile, runClaudeQuestion } from "./engine.js";
 import { Semaphore } from "./semaphore.js";
 import { fingerprint, log, tryConnect } from "./util.js";
@@ -36,6 +36,8 @@ interface ServeConfig {
   pairPort?: number;
   sessionTimeoutMs: number;
   claudeTimeoutMs: number;
+  /** Upper bound (ms) that an asker-requested timeout can request from us. */
+  maxClaudeTimeoutMs: number;
   claudeBin: string;
   allowedTools: string;
   model?: string;
@@ -57,7 +59,8 @@ function readConfig(): ServeConfig {
     pairHost: process.env.BRIDGE_PAIR_HOST,
     pairPort: process.env.BRIDGE_PAIR_PORT ? Number(process.env.BRIDGE_PAIR_PORT) : undefined,
     sessionTimeoutMs: Number(process.env.SESSION_TIMEOUT_MS ?? 30_000),
-    claudeTimeoutMs: Number(process.env.CLAUDE_TIMEOUT_MS ?? 180_000),
+    claudeTimeoutMs: Number(process.env.CLAUDE_TIMEOUT_MS ?? 1_800_000),
+    maxClaudeTimeoutMs: Number(process.env.MAX_CLAUDE_TIMEOUT_MS ?? 3_600_000),
     claudeBin: process.env.CLAUDE_BIN ?? "claude",
     allowedTools: process.env.ALLOWED_TOOLS ?? "Read,Grep,Glob",
     model: process.env.MODEL,
@@ -131,11 +134,19 @@ export async function serve(): Promise<void> {
           `on another machine. The agent can read its own project files and answer in text, ` +
           `but cannot modify them and cannot see anything in this project. Use this to ` +
           `gather factual context from another project without pulling its source into the ` +
-          `current conversation. Be specific in your question.`,
+          `current conversation. Be specific in your question. For deep / domain-knowledge ` +
+          `queries that may take many minutes, pass a higher \`timeout_ms\`.`,
         inputSchema: {
           type: "object",
           properties: {
             question: { type: "string", description: "Self-contained, specific question." },
+            timeout_ms: {
+              type: "number",
+              description:
+                "Optional override (milliseconds) for the spawned claude -p on the peer. " +
+                "Receiver clamps to its own safety max. Use higher values for deep, multi-file " +
+                "domain questions; lower for quick lookups.",
+            },
           },
           required: ["question"],
           additionalProperties: false,
@@ -182,7 +193,7 @@ export async function serve(): Promise<void> {
     ],
   }));
 
-  mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+  mcp.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const name = request.params.name;
     const args = request.params.arguments ?? {};
     try {
@@ -191,7 +202,23 @@ export async function serve(): Promise<void> {
         if (typeof question !== "string" || !question.trim()) {
           return errOut("`question` must be a non-empty string.");
         }
-        const answer = await askPeer(question, cfg);
+        const reqTimeout = (args as { timeout_ms?: unknown }).timeout_ms;
+        const timeoutMs = typeof reqTimeout === "number" && reqTimeout > 0 ? reqTimeout : undefined;
+        const progressToken = extra._meta?.progressToken;
+        const sendProgress =
+          progressToken !== undefined
+            ? async (progress: number, message: string): Promise<void> => {
+                try {
+                  await extra.sendNotification({
+                    method: "notifications/progress",
+                    params: { progressToken, progress, message },
+                  });
+                } catch {
+                  // notifications are best-effort
+                }
+              }
+            : undefined;
+        const answer = await askPeer(question, cfg, { timeoutMs, sendProgress });
         return okOut(answer);
       }
       if (name === TOOL_START_PAIRING) {
@@ -362,14 +389,39 @@ async function handleIncoming(
   }
   log("info", `[${peer.label}] q=${req.id} (${req.question.slice(0, 80).replace(/\s+/g, " ")}${req.question.length > 80 ? "…" : ""})`);
 
-  let resp: AskResponse;
+  // Pick the effective claude-p timeout: asker's request if provided, capped
+  // by our local safety bound. Otherwise our own configured default.
+  const requested = typeof req.timeout_ms === "number" && req.timeout_ms > 0 ? req.timeout_ms : undefined;
+  const effectiveTimeout = Math.min(requested ?? cfg.claudeTimeoutMs, cfg.maxClaudeTimeoutMs);
+
+  // If the asker opted in, stream progress frames over the same channel.
+  let progressSeq = 0;
+  const wantsProgress = req.wants_progress === true;
+  const onEvent = wantsProgress
+    ? (summary: string, elapsedMs: number): void => {
+        const frame: ProgressFrame = {
+          type: "progress",
+          id: req.id,
+          seq: ++progressSeq,
+          message: summary,
+          elapsed_ms: elapsedMs,
+        };
+        try {
+          channel.send(Buffer.from(JSON.stringify(frame), "utf8"));
+        } catch (err) {
+          log("warn", `[${peer.label}] failed to send progress: ${(err as Error).message}`);
+        }
+      }
+    : undefined;
+
+  let resp: TerminalFrame;
   try {
     await semaphore.acquire(cfg.sessionTimeoutMs);
     try {
       const answer = await runClaudeQuestion(req.question, {
         projectDir: cfg.projectDir,
         allowedTools: cfg.allowedTools,
-        timeoutMs: cfg.claudeTimeoutMs,
+        timeoutMs: effectiveTimeout,
         claudeBin: cfg.claudeBin,
         model: cfg.model,
         maxBudgetUsd: cfg.maxBudgetUsd,
@@ -377,6 +429,7 @@ async function handleIncoming(
         logFile: cfg.logFile,
         peerLabel: peer.label,
         questionId: req.id,
+        onEvent,
       });
       resp = { type: "ok", id: req.id, answer };
       log("info", `[${peer.label}] a=${req.id} (${answer.length} chars)`);
@@ -393,7 +446,14 @@ async function handleIncoming(
 
 // ---------- Outgoing: local AI asked us, we ask the peer ----------
 
-async function askPeer(question: string, cfg: ServeConfig): Promise<string> {
+async function askPeer(
+  question: string,
+  cfg: ServeConfig,
+  opts: {
+    timeoutMs?: number;
+    sendProgress?: (progress: number, message: string) => Promise<void>;
+  }
+): Promise<string> {
   const peer = getPairedPeer();
   if (!peer) {
     throw new Error("No paired peer. Use start_pairing on one side and complete_pairing on the other.");
@@ -417,13 +477,48 @@ async function askPeer(question: string, cfg: ServeConfig): Promise<string> {
   const kp = ourKeypair();
   const peerStatic = Buffer.from(peer.publicKey, "base64");
   const channel = await sessionInitiator(framed, kp, peerStatic, cfg.sessionTimeoutMs);
-  const req: AskRequest = { type: "ask", id: randomUUID(), question };
+
+  const effectiveTimeout = opts.timeoutMs ?? cfg.claudeTimeoutMs;
+  const wantsProgress = !!opts.sendProgress;
+
+  const req: AskRequest = {
+    type: "ask",
+    id: randomUUID(),
+    question,
+    timeout_ms: opts.timeoutMs,
+    wants_progress: wantsProgress,
+  };
   channel.send(Buffer.from(JSON.stringify(req), "utf8"));
-  const respRaw = await channel.recv(cfg.sessionTimeoutMs + cfg.claudeTimeoutMs);
-  channel.close();
-  const resp = JSON.parse(respRaw.toString("utf8")) as AskResponse;
-  if (resp.type === "err") {
-    throw new Error(`Peer answered with error: ${resp.message}`);
+
+  // Read frames in a loop until a terminal (ok/err) frame arrives. Progress
+  // frames are forwarded as MCP notifications. Total wait is bounded by
+  // sessionTimeoutMs + effectiveTimeout — the same overall ceiling as before.
+  const deadline = Date.now() + cfg.sessionTimeoutMs + effectiveTimeout;
+  try {
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `Peer did not produce a final answer within ${cfg.sessionTimeoutMs + effectiveTimeout}ms`
+        );
+      }
+      const frameRaw = await channel.recv(remaining);
+      const frame = JSON.parse(frameRaw.toString("utf8")) as AnswerFrame;
+      if (frame.type === "progress") {
+        if (opts.sendProgress) {
+          await opts.sendProgress(frame.seq, frame.message);
+        }
+        continue;
+      }
+      if (frame.type === "err") {
+        throw new Error(`Peer answered with error: ${frame.message}`);
+      }
+      if (frame.type === "ok") {
+        return frame.answer;
+      }
+      throw new Error(`Unknown frame type from peer: ${(frame as { type?: string }).type}`);
+    }
+  } finally {
+    channel.close();
   }
-  return resp.answer;
 }

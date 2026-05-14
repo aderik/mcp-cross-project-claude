@@ -14,6 +14,9 @@ export interface EngineConfig {
   logFile?: string;
   peerLabel?: string;
   questionId?: string;
+  /** Optional callback fired for each significant stream-json event during
+   * the claude -p run. Used by the bridge to stream progress to the peer. */
+  onEvent?: (summary: string, elapsedMs: number) => void;
 }
 
 export function defaultLogFile(): string {
@@ -144,6 +147,7 @@ export function runClaudeQuestion(question: string, cfg: EngineConfig): Promise<
       qid,
       `spawn cwd=${cfg.projectDir} timeout=${cfg.timeoutMs}ms allowed=[${cfg.allowedTools}] question="${truncate(question, 200)}"`
     );
+    const startedAt = Date.now();
 
     const child = spawn(cfg.claudeBin, args, {
       cwd: cfg.projectDir,
@@ -180,7 +184,16 @@ export function runClaudeQuestion(question: string, cfg: EngineConfig): Promise<
         try {
           const ev = JSON.parse(line) as StreamEvent;
           const summary = summarize(ev);
-          if (summary) logEvent(logFile, peer, qid, summary);
+          if (summary) {
+            logEvent(logFile, peer, qid, summary);
+            if (cfg.onEvent) {
+              try {
+                cfg.onEvent(summary, Date.now() - startedAt);
+              } catch {
+                // onEvent should not break the run
+              }
+            }
+          }
           if (ev.type === "result" && typeof ev.result === "string") {
             finalResult = ev.result;
           }
