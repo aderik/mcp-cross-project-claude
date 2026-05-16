@@ -281,3 +281,18 @@ export type TerminalFrame =
   | { type: "err"; id: string; message: string };
 
 export type AnswerFrame = ProgressFrame | TerminalFrame;
+
+export interface PingRequest {
+  type: "ping";
+  id: string;
+}
+
+export interface PongResponse {
+  type: "pong";
+  id: string;
+  label: string;
+  fingerprint: string;
+  version: string;
+}
+
+export type InboundRequest = AskRequest | PingRequest;

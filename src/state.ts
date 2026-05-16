@@ -15,6 +15,10 @@ export interface PairedPeer {
   publicKey: string; // base64
   fingerprint: string;
   pairedAt: string;
+  /** Bridge version reported by the peer on its most recent pong. */
+  peerVersion?: string;
+  /** ISO timestamp of the last successful ping/pong with this peer. */
+  lastSeenAt?: string;
 }
 
 interface StateV2 {
@@ -163,6 +167,14 @@ export function clearPairedPeer(): boolean {
   s.peer = null;
   writeState(s);
   return true;
+}
+
+export function updatePairedPeerLastSeen(version: string): void {
+  const s = loadState();
+  if (s.peer === null) return;
+  s.peer.peerVersion = version;
+  s.peer.lastSeenAt = new Date().toISOString();
+  writeState(s);
 }
 
 export function findPeerByPublicKey(pub: Buffer): PairedPeer | null {

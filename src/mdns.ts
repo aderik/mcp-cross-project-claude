@@ -7,7 +7,7 @@ import { networkInterfaces } from "node:os";
  * (169.254/16). Used as a TXT-record fallback when avahi/bonjour-service
  * fail to publish A records correctly.
  */
-function localIPv4s(): string[] {
+export function localIPv4s(): string[] {
   const result: string[] = [];
   const ifaces = networkInterfaces();
   for (const name of Object.keys(ifaces)) {

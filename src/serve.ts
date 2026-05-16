@@ -3,16 +3,26 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createServer } from "node:net";
 import { randomUUID } from "node:crypto";
-import { advertise, findPeerByFingerprint, SERVICE_TYPE_SESSION, shutdownMdns } from "./mdns.js";
+import { hostname } from "node:os";
+import { advertise, findPeerByFingerprint, localIPv4s, SERVICE_TYPE_SESSION, shutdownMdns } from "./mdns.js";
 import {
   clearPairedPeer,
   findPeerByPublicKey,
   getPairedPeer,
   ourKeypair,
   ourLabel,
+  updatePairedPeerLastSeen,
 } from "./state.js";
 import { FramedSocket, sessionInitiator, sessionResponder } from "./transport.js";
-import type { AnswerFrame, AskRequest, ProgressFrame, SecureChannel, TerminalFrame } from "./transport.js";
+import type {
+  AnswerFrame,
+  AskRequest,
+  InboundRequest,
+  PongResponse,
+  ProgressFrame,
+  SecureChannel,
+  TerminalFrame,
+} from "./transport.js";
 import { defaultLogFile, runClaudeQuestion } from "./engine.js";
 import { Semaphore } from "./semaphore.js";
 import { fingerprint, log, tryConnect } from "./util.js";
@@ -24,6 +34,9 @@ export const TOOL_START_PAIRING = "start_pairing";
 export const TOOL_COMPLETE_PAIRING = "complete_pairing";
 export const TOOL_UNPAIR = "unpair_peer";
 export const TOOL_PEER_STATUS = "peer_status";
+export const TOOL_PING_PEER = "ping_peer";
+
+export const BRIDGE_VERSION = "0.4.4";
 
 interface ServeConfig {
   projectDir: string;
@@ -120,7 +133,7 @@ export async function serve(): Promise<void> {
   const mcp = new Server(
     {
       name: `cross-project-claude:${ourLabel()}`,
-      version: "0.4.0",
+      version: BRIDGE_VERSION,
     },
     { capabilities: { tools: {} } }
   );
@@ -186,8 +199,18 @@ export async function serve(): Promise<void> {
       {
         name: TOOL_PEER_STATUS,
         description:
-          `Return this bridge's identity and the paired peer (if any). Useful to check ` +
-          `whether pairing is set up before asking a cross-project question.`,
+          `Return this bridge's identity (label, fingerprint, version, hostname, LAN IPs, ` +
+          `listen port, mDNS state) and the paired peer if any. Useful to check whether ` +
+          `pairing is set up and to gather diagnostic info before troubleshooting.`,
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      },
+      {
+        name: TOOL_PING_PEER,
+        description:
+          `Quick liveness check: open an encrypted session to the paired peer and exchange ` +
+          `a ping/pong frame (no claude-p spawn, no API cost). Returns peer label, ` +
+          `fingerprint, version, and round-trip latency. Errors if peer is unreachable, ` +
+          `the handshake fails, or no peer is paired.`,
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
       },
     ],
@@ -292,11 +315,18 @@ export async function serve(): Promise<void> {
             {
               our_label: ourLabel(),
               our_fingerprint: ourFp,
+              our_version: BRIDGE_VERSION,
+              our_hostname: hostname(),
+              our_ipv4: localIPv4s(),
+              our_listen_port: actualPort,
+              our_mdns: cfg.useMdns,
               paired: peer
                 ? {
                     label: peer.label,
                     fingerprint: peer.fingerprint,
                     paired_at: peer.pairedAt,
+                    peer_version: peer.peerVersion ?? "(unknown — run ping_peer)",
+                    last_seen_at: peer.lastSeenAt ?? "(never)",
                   }
                 : null,
               pairing_in_progress: pendingPair !== null,
@@ -305,6 +335,10 @@ export async function serve(): Promise<void> {
             2
           )
         );
+      }
+      if (name === TOOL_PING_PEER) {
+        const result = await pingPeer(cfg);
+        return okOut(JSON.stringify(result, null, 2));
       }
       return errOut(`Unknown tool: ${name}`);
     } catch (err) {
@@ -376,9 +410,23 @@ async function handleIncoming(
     channel.close();
     return;
   }
-  let req: AskRequest;
+  let req: InboundRequest;
   try {
-    req = JSON.parse(reqRaw.toString("utf8")) as AskRequest;
+    req = JSON.parse(reqRaw.toString("utf8")) as InboundRequest;
+    if (req.type === "ping") {
+      // Liveness check — answer with our identity + version, no claude-p spawn.
+      const pong: PongResponse = {
+        type: "pong",
+        id: req.id,
+        label: ourLabel(),
+        fingerprint: fingerprint(ourKeypair().publicKey),
+        version: BRIDGE_VERSION,
+      };
+      channel.send(Buffer.from(JSON.stringify(pong), "utf8"));
+      channel.close();
+      log("info", `[${peer.label}] ping ok`);
+      return;
+    }
     if (req.type !== "ask" || typeof req.question !== "string") {
       throw new Error("Malformed request");
     }
@@ -442,6 +490,71 @@ async function handleIncoming(
   }
   channel.send(Buffer.from(JSON.stringify(resp), "utf8"));
   channel.close();
+}
+
+// ---------- Outgoing: ping the paired peer ----------
+
+async function pingPeer(cfg: ServeConfig): Promise<{
+  peer_label: string;
+  peer_fingerprint: string;
+  peer_version: string;
+  latency_ms: number;
+  remote_host: string;
+  remote_port: number;
+  discovery: "fixed" | "mdns";
+}> {
+  const peer = getPairedPeer();
+  if (!peer) {
+    throw new Error("No paired peer. Use start_pairing / complete_pairing first.");
+  }
+  let candidates: string[];
+  let port: number;
+  let discovery: "fixed" | "mdns";
+  if (cfg.peerHost && cfg.peerPort) {
+    candidates = [cfg.peerHost];
+    port = cfg.peerPort;
+    discovery = "fixed";
+  } else {
+    if (!cfg.useMdns) {
+      throw new Error("No PEER_HOST/PEER_PORT set and mDNS disabled — cannot route ping.");
+    }
+    const discovered = await findPeerByFingerprint(SERVICE_TYPE_SESSION, peer.fingerprint, 5_000);
+    candidates = discovered.addresses.length > 0 ? discovered.addresses : [discovered.host];
+    port = discovered.port;
+    discovery = "mdns";
+  }
+  const start = Date.now();
+  const socket = await tryConnect(candidates, port);
+  const framed = new FramedSocket(socket);
+  const kp = ourKeypair();
+  const peerStatic = Buffer.from(peer.publicKey, "base64");
+  const channel = await sessionInitiator(framed, kp, peerStatic, cfg.sessionTimeoutMs);
+  try {
+    const id = randomUUID();
+    channel.send(Buffer.from(JSON.stringify({ type: "ping", id }), "utf8"));
+    const raw = await channel.recv(cfg.sessionTimeoutMs);
+    const pong = JSON.parse(raw.toString("utf8")) as PongResponse;
+    if (pong.type !== "pong" || pong.id !== id) {
+      throw new Error("Peer returned malformed pong");
+    }
+    const latency = Date.now() - start;
+    updatePairedPeerLastSeen(pong.version);
+    const remoteHost =
+      (socket.remoteAddress ?? "").startsWith("::ffff:")
+        ? (socket.remoteAddress ?? "").slice(7)
+        : socket.remoteAddress ?? "?";
+    return {
+      peer_label: pong.label,
+      peer_fingerprint: pong.fingerprint,
+      peer_version: pong.version,
+      latency_ms: latency,
+      remote_host: remoteHost,
+      remote_port: socket.remotePort ?? port,
+      discovery,
+    };
+  } finally {
+    channel.close();
+  }
 }
 
 // ---------- Outgoing: local AI asked us, we ask the peer ----------
