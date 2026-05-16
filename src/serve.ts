@@ -36,7 +36,7 @@ export const TOOL_UNPAIR = "unpair_peer";
 export const TOOL_PEER_STATUS = "peer_status";
 export const TOOL_PING_PEER = "ping_peer";
 
-export const BRIDGE_VERSION = "0.4.4";
+export const BRIDGE_VERSION = "0.4.5";
 
 interface ServeConfig {
   projectDir: string;
@@ -361,15 +361,39 @@ export async function serve(): Promise<void> {
       `maxConcurrent=${cfg.maxConcurrent} log=${cfg.logFile} depth=${cfg.depth}`
   );
 
-  const shutdown = (): void => {
+  let shuttingDown = false;
+  const shutdown = (reason: string): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log("info", `shutting down: ${reason}`);
     if (pendingPair) pendingPair.cancel();
     if (advert) advert.stop();
     shutdownMdns();
     tcpServer.close();
     process.exit(0);
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+
+  // The bridge exits when its MCP client disconnects — that's the normal
+  // signal that this Claude Code session is gone (window closed, /mcp
+  // reconnect respawning, etc.). Without this the process orphans, holds
+  // its TCP port, keeps advertising on mDNS, and confuses future pairings.
+  mcp.onclose = (): void => shutdown("MCP client disconnected");
+  process.stdin.on("end", () => shutdown("stdin EOF"));
+  process.stdin.on("close", () => shutdown("stdin closed"));
+  process.stdin.on("error", () => shutdown("stdin error"));
+
+  // Defence in depth: if our parent process dies ungracefully (without
+  // closing stdio), we're reparented to init (PID 1 on Linux). Detect that
+  // and exit. Cheap poll, runs once per 10s.
+  const initialPpid = process.ppid;
+  setInterval(() => {
+    if (process.ppid !== initialPpid && process.ppid === 1) {
+      shutdown(`parent ${initialPpid} died (reparented to init)`);
+    }
+  }, 10_000).unref();
+
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
 function okOut(text: string): { content: Array<{ type: "text"; text: string }>; isError?: false } {
